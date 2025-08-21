@@ -17,6 +17,7 @@ import TopicsEditor from '@/components/TopicsEditor'
 import { clearCommentsAndDocstrings } from '@/components/utils'
 import { useAutoResize } from '@/components/useAutoResize'
 import { DatasetItem } from '@/components/types'
+import { useAuth } from '@/components/auth-context'
 
 type NewDatasetItem = Omit<DatasetItem, 'id' | 'createdAt' | 'updatedAt' | 'lastRunSuccessful'> & { lastRunSuccessful?: boolean }
 
@@ -29,6 +30,7 @@ interface TestResult {
 
 export default function NewReview() {
   const router = useRouter()
+  const { headers: authHeaders } = useAuth()
   const [saving, setSaving] = useState(false)
   const [running, setRunning] = useState(false)
   const [testResult, setTestResult] = useState<TestResult | null>(null)
@@ -55,7 +57,7 @@ export default function NewReview() {
     try {
       const response = await fetch('/api/dataset', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { ...authHeaders(), 'Content-Type': 'application/json' },
         body: JSON.stringify(item),
       })
       if (response.ok) {
@@ -75,14 +77,14 @@ export default function NewReview() {
         }
         const vRes = await fetch(`/api/dataset/${newItem.id}/versions`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { ...authHeaders(), 'Content-Type': 'application/json' },
           body: JSON.stringify({ data: snapshot, parentId: null, label: initialVersionLabel || 'v1' })
         })
         if (vRes.ok) {
           const created = await vRes.json()
           await fetch(`/api/dataset/${newItem.id}/head`, {
             method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
+            headers: { ...authHeaders(), 'Content-Type': 'application/json' },
             body: JSON.stringify({ versionId: created.id })
           })
         }
@@ -109,7 +111,7 @@ export default function NewReview() {
     try {
       const response = await fetch('/api/run-tests', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { ...authHeaders(), 'Content-Type': 'application/json' },
         body: JSON.stringify({ solution: item.solution, tests: item.unit_tests }),
       })
       const result = await response.json()

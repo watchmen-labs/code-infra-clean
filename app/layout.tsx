@@ -1,8 +1,10 @@
 import type { Metadata } from 'next'
 import { Inter } from 'next/font/google'
 import './globals.css'
-
+import { AuthProvider } from '@/components/auth-context'
+import { AuthGate } from '@/components/auth-gate'
 const inter = Inter({ subsets: ['latin'] })
+
 
 export const metadata: Metadata = {
   title: 'Competitive Programming Dataset Manager',
@@ -19,7 +21,11 @@ export default function RootLayout({
     <html lang="en">
       <body className={inter.className}>
         <main className="min-h-screen bg-background">
-          {children}
+          <AuthProvider>
+            <AuthGate>
+            {children}\
+            </AuthGate>
+          </AuthProvider>
         </main>
       </body>
     </html>

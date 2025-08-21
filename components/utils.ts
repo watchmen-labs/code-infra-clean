@@ -292,3 +292,69 @@ export const executeExport = (
   linkElement.setAttribute('download', exportFileDefaultName);
   linkElement.click();
 }
+
+
+
+// components/VersionLabelUtils.ts
+export const splitByCommaOrSemicolon = (s: string) =>
+  s.split(/[,;]+/).map(x => x.trim()).filter(Boolean);
+
+export const parseStandardLabel = (label?: string | null) => {
+  const raw = (label || "").trim();
+  if (!raw) return { editor: "", stamps: [] as string[] };
+  const idx = raw.indexOf(":");
+  if (idx === -1) return { editor: raw, stamps: [] };
+  const editor = raw.slice(0, idx).trim();
+  const rest = raw.slice(idx + 1).trim();
+  const stamps = rest ? Array.from(new Set(splitByCommaOrSemicolon(rest))) : [];
+  return { editor, stamps };
+};
+
+export const formatStandardLabel = (editor: string, stamps: string[]) => {
+  const uniq = Array.from(new Set(stamps.filter(Boolean)));
+  const base = editor || "";
+  if (uniq.length === 0) return base ? `${base}:` : "";
+  return `${base}: ${uniq.join(", ")}`;
+};
+
+export const mergeStampIntoLabel = (label: string | null | undefined, stamper: string) => {
+  const { editor, stamps } = parseStandardLabel(label);
+  const nextEditor = editor || "";
+  return formatStandardLabel(nextEditor, [...stamps, stamper]);
+};
+
+
+// components/CacheUtils.ts
+export const readCache = (key: string, ttlMs = 60_000) => {
+  if (typeof window === "undefined") return null;
+  const raw = sessionStorage.getItem(key);
+  if (!raw) return null;
+  try {
+    const j = JSON.parse(raw);
+    if (!j || !j.ts || !("data" in j)) return null;
+    if (Date.now() - j.ts > ttlMs) {
+      sessionStorage.removeItem(key);
+      return null;
+    }
+    return j.data;
+  } catch {
+    sessionStorage.removeItem(key);
+    return null;
+  }
+};
+
+export const writeCache = (key: string, data: any) => {
+  if (typeof window === "undefined") return;
+  sessionStorage.setItem(key, JSON.stringify({ ts: Date.now(), data }));
+};
+
+export const updateArrayItemInCacheById = (key: string, updated: { id: string } & Record<string, any>) => {
+  const cached = readCache(key);
+  if (!cached || !Array.isArray(cached)) return;
+  const idx = cached.findIndex((x: any) => x.id === updated.id);
+  if (idx >= 0) {
+    const next = [...cached];
+    next[idx] = { ...next[idx], ...updated };
+    writeCache(key, next);
+  }
+};

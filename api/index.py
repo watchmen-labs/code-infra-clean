@@ -1,24 +1,25 @@
+# index.py
 from flask import Flask, request, jsonify, g
 from flask_cors import CORS
 import os
-import tempfile
-import subprocess
 import sys
 import json
 import requests
 from datetime import datetime
 from dotenv import load_dotenv
-import xml.etree.ElementTree as ET
 from functools import wraps
 from supabase import create_client, Client
 import urllib.parse
 import logging
 import time
 import uuid
-from werkzeug.exceptions import HTTPException
 import io
 import csv
+from werkzeug.exceptions import HTTPException
 
+# ------------------------------------------------------------------------------
+# Logging
+# ------------------------------------------------------------------------------
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
@@ -26,15 +27,22 @@ logging.basicConfig(
 )
 logger = logging.getLogger("api")
 
+# ------------------------------------------------------------------------------
+# App / CORS / Env
+# ------------------------------------------------------------------------------
 app = Flask(__name__)
 CORS(app)
-
 load_dotenv()
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_ANON_KEY")
+if not SUPABASE_URL or not SUPABASE_KEY:
+    logger.warning("SUPABASE_URL or SUPABASE_* key missing; Supabase client may fail.")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+# ------------------------------------------------------------------------------
+# Request logging & error handling
+# ------------------------------------------------------------------------------
 @app.before_request
 def _log_request_start():
     g._start_time = time.time()
@@ -46,7 +54,8 @@ def _log_request_end(response):
         duration_ms = (time.time() - getattr(g, "_start_time", time.time())) * 1000
         uid = getattr(g, "user_id", None)
         logger.info(
-            f"{request.method} {request.path} {response.status_code} {duration_ms:.2f}ms rid={getattr(g,'_rid','-')}" + (f" uid={uid}" if uid else "")
+            f"{request.method} {request.path} {response.status_code} {duration_ms:.2f}ms "
+            f"rid={getattr(g,'_rid','-')}" + (f" uid={uid}" if uid else "")
         )
     except Exception:
         pass
@@ -62,6 +71,9 @@ def _handle_unhandled_exception(e):
     logger.exception(f"Unhandled exception path={request.path} rid={getattr(g,'_rid','-')}")
     return jsonify({"error": "Internal Server Error"}), 500
 
+# ------------------------------------------------------------------------------
+# Auth helpers
+# ------------------------------------------------------------------------------
 def get_current_user():
     auth = request.headers.get("Authorization", "")
     token = None
@@ -69,14 +81,20 @@ def get_current_user():
         token = auth.split(" ", 1)[1].strip()
     if not token:
         return None, None
+    # Try Python client
     try:
         u = supabase.auth.get_user(token)
         if getattr(u, "user", None) and getattr(u.user, "id", None):
             return u.user.id, getattr(u.user, "email", None)
     except Exception:
         pass
+    # Fallback raw HTTP (service key)
     try:
-        r = requests.get(f"{SUPABASE_URL}/auth/v1/user", headers={"Authorization": f"Bearer {token}", "apikey": SUPABASE_KEY}, timeout=15)
+        r = requests.get(
+            f"{SUPABASE_URL}/auth/v1/user",
+            headers={"Authorization": f"Bearer {token}", "apikey": SUPABASE_KEY},
+            timeout=15,
+        )
         if r.status_code == 200:
             j = r.json()
             return j.get("id"), j.get("email")
@@ -96,28 +114,9 @@ def auth_required(fn):
         return fn(*args, **kwargs)
     return wrapper
 
-def _flatten_dataset_row(row):
-    meta = row.get("meta") or {}
-    out = {"id": row.get("id")}
-    out.update(meta)
-    out["notes"] = row.get("notes", "")
-    out["lastRunSuccessful"] = row.get("lastRunSuccessful", False)
-    out["createdAt"] = row.get("createdAt")
-    out["updatedAt"] = row.get("updatedAt")
-    if "currentVersionId" in row:
-        out["currentVersionId"] = row.get("currentVersionId")
-    return out
-
-def _split_meta(payload):
-    reserved = {"notes", "lastRunSuccessful", "createdAt", "updatedAt", "currentVersionId", "id"}
-    meta = {k: v for k, v in payload.items() if k not in reserved}
-    base = {
-        "notes": payload.get("notes", ""),
-        "lastRunSuccessful": payload.get("lastRunSuccessful", False),
-        "currentVersionId": payload.get("currentVersionId", None),
-    }
-    return base, meta
-
+# ------------------------------------------------------------------------------
+# Normalize & transform helpers
+# ------------------------------------------------------------------------------
 def _normalize_topics(v):
     if isinstance(v, list):
         return [str(x) for x in v if str(x).strip() != ""]
@@ -138,12 +137,12 @@ def _flatten_dataset_row(row):
     """
     Convert the DB row into the shape expected by the frontend.
 
-    ✅ NEW: If the prompt (and friends) are stored as *top-level* columns, fall
-    back to those. This guarantees that `prompt`, `inputs`, … are always
-    populated even when older rows still use the legacy schema.
+    Ensures that `prompt`, `inputs`, etc. are always present by
+    falling back to top-level columns if `meta` is missing/legacy.
     """
     meta = row.get("meta") or {}
-    # ------------------------------------------------------------------⬇ NEW
+
+    # Backfill from top-level if missing in meta (legacy compatibility)
     for k in (
         "prompt",
         "inputs",
@@ -162,11 +161,10 @@ def _flatten_dataset_row(row):
             v = row.get(k)
             if v is not None:
                 meta[k] = v
-    # ------------------------------------------------------------------⬆ NEW
 
     out = {"id": row.get("id")}
     out.update(meta)
-    out["notes"] = row.get("notes", "")
+    out["notes"] = row.get("notes", "") or ""
     out["lastRunSuccessful"] = row.get("lastRunSuccessful", False)
     out["createdAt"] = row.get("createdAt")
     out["updatedAt"] = row.get("updatedAt")
@@ -174,16 +172,13 @@ def _flatten_dataset_row(row):
         out["currentVersionId"] = row.get("currentVersionId")
     return out
 
-
 def _row_from_generic_payload(payload, now):
     """
-    Normalise an arbitrary task-like dict into the row we insert.
+    Normalize a task-like dict into the row we insert.
 
-    ✅ NEW: In addition to `meta`, we also fill the legacy *top-level* columns
-    (prompt, inputs, …) so that any NOT-NULL constraints are satisfied and old
-    client code keeps working.
+    Writes both `meta` and top-level columns to satisfy any legacy NOT NULL
+    constraints and to keep dashboards/queries working.
     """
-    # ----------------------------- meta -----------------------------------
     meta = {
         "prompt": payload.get("prompt", "") or "",
         "inputs": payload.get("inputs", "") or "",
@@ -201,9 +196,8 @@ def _row_from_generic_payload(payload, now):
         "difficulty": _normalize_difficulty(payload.get("difficulty")),
     }
 
-    # -------------------------- top-level ---------------------------------
     row = {
-        # legacy columns
+        # sync to legacy top-level columns
         "prompt": meta["prompt"],
         "inputs": meta["inputs"],
         "outputs": meta["outputs"],
@@ -217,8 +211,8 @@ def _row_from_generic_payload(payload, now):
         "time_complexity": meta["time_complexity"],
         "space_complexity": meta["space_complexity"],
         # shared
-        "notes": payload.get("notes", ""),
-        "lastRunSuccessful": False,
+        "notes": payload.get("notes", "") or "",
+        "lastRunSuccessful": bool(payload.get("lastRunSuccessful", False)),
         "createdAt": now,
         "updatedAt": now,
         "currentVersionId": payload.get("currentVersionId"),
@@ -226,6 +220,9 @@ def _row_from_generic_payload(payload, now):
     }
     return row
 
+# ------------------------------------------------------------------------------
+# Auth endpoints
+# ------------------------------------------------------------------------------
 @app.route('/api/auth/user', methods=['GET'])
 def auth_user():
     uid, email = get_current_user()
@@ -240,6 +237,9 @@ def auth_start():
     logger.info(f"Auth start redirect_to={redirect_to} rid={getattr(g,'_rid','-')}")
     return jsonify({"url": url})
 
+# ------------------------------------------------------------------------------
+# Dataset CRUD
+# ------------------------------------------------------------------------------
 @app.route('/api/dataset', methods=['GET'])
 def get_dataset():
     try:
@@ -254,17 +254,9 @@ def get_dataset():
 @app.route('/api/dataset', methods=['POST'])
 def create_dataset_item():
     try:
-        data = request.json or {}
+        data = request.get_json(silent=True) or {}
         now = datetime.now().isoformat()
-        base, meta = _split_meta(data)
-        row = {
-            "notes": base["notes"],
-            "lastRunSuccessful": False,
-            "createdAt": now,
-            "updatedAt": now,
-            "currentVersionId": base.get("currentVersionId"),
-            "meta": meta
-        }
+        row = _row_from_generic_payload(data, now)
         res = supabase.table('dataset').insert(row).execute()
         created = (getattr(res, "data", []) or [])[0]
         return jsonify(_flatten_dataset_row(created))
@@ -275,7 +267,7 @@ def create_dataset_item():
 @app.route('/api/dataset/_bulk', methods=['POST'])
 def bulk_create_dataset_items():
     try:
-        data = request.get_json() or {}
+        data = request.get_json(silent=True) or {}
         items = data.get('items', [])
         now = datetime.now().isoformat()
         rows = []
@@ -305,24 +297,38 @@ def get_dataset_item(item_id):
 @app.route('/api/dataset/<item_id>', methods=['PUT'])
 def update_dataset_item(item_id):
     try:
-        data = request.json or {}
+        data = request.get_json(silent=True) or {}
         res = supabase.table('dataset').select('*').eq('id', item_id).single().execute()
         existing = getattr(res, "data", None)
         if not existing:
             return jsonify({'error': 'Item not found'}), 404
+
+        # Merge meta
         _, incoming_meta = _split_meta(data)
-        merged_meta = {}
-        if isinstance(existing.get("meta"), dict):
-            merged_meta.update(existing.get("meta") or {})
-        merged_meta.update(incoming_meta)
+        merged_meta = (existing.get("meta") or {}).copy()
+        merged_meta.update(incoming_meta or {})
+        merged_meta["topics"] = _normalize_topics(merged_meta.get("topics"))
+        if "difficulty" in merged_meta:
+            merged_meta["difficulty"] = _normalize_difficulty(merged_meta.get("difficulty"))
+
+        # sync selected fields to top-level
+        top_level_sync_keys = [
+            "prompt", "inputs", "outputs", "unit_tests", "solution",
+            "code_file", "language", "group", "difficulty", "topics",
+            "time_complexity", "space_complexity",
+        ]
+        tl_updates = {k: merged_meta.get(k) for k in top_level_sync_keys if k in merged_meta}
+
         updated_item = {
-            "lastRunSuccessful": False,
-            "notes": data.get('notes', existing.get("notes", "")),
+            "lastRunSuccessful": data.get('lastRunSuccessful', existing.get("lastRunSuccessful", False)),
+            "notes": data.get('notes', existing.get("notes", "")) or "",
             "updatedAt": datetime.now().isoformat(),
-            "meta": merged_meta
+            "meta": merged_meta,
+            **tl_updates,
         }
         if "currentVersionId" in data:
             updated_item["currentVersionId"] = data.get("currentVersionId")
+
         supabase.table('dataset').update(updated_item).eq('id', item_id).execute()
         res2 = supabase.table('dataset').select('*').eq('id', item_id).single().execute()
         row = getattr(res2, "data", None)
@@ -340,6 +346,9 @@ def delete_dataset_item(item_id):
         logger.exception(f"Failed to delete dataset item id={item_id} rid={getattr(g,'_rid','-')}")
         return jsonify({'error': f'Failed to delete dataset item: {str(e)}'}), 500
 
+# ------------------------------------------------------------------------------
+# Versions
+# ------------------------------------------------------------------------------
 @app.route('/api/dataset/<item_id>/versions', methods=['GET'])
 def list_task_versions(item_id):
     try:
@@ -372,8 +381,8 @@ def list_task_versions(item_id):
 @app.route('/api/dataset/<item_id>/versions', methods=['POST'])
 def create_task_version(item_id):
     try:
-        uid, email = get_current_user()
-        body = request.get_json() or {}
+        uid, _ = get_current_user()
+        body = request.get_json(silent=True) or {}
         payload = body.get("data")
         parent_id = body.get("parentId")
         label = body.get("label")
@@ -422,10 +431,10 @@ def get_task_version(item_id, version_id):
         logger.exception(f"Failed to fetch version item_id={item_id} version_id={version_id} rid={getattr(g,'_rid','-')}")
         return jsonify({'error': f'Failed to fetch version: {str(e)}'}), 500
 
-@app.route('/api/dataset/<item_id>/versions/<version_id>', methods=['PATCH'])
+@app.route('/api/dataset/<item_id>/versions/<version_id>', methods=['PATCH', 'PUT'])
 def update_task_version(item_id, version_id):
     try:
-        body = request.get_json() or {}
+        body = request.get_json(silent=True) or {}
         updates = {}
         if "data" in body:
             updates["data"] = body.get("data")
@@ -452,7 +461,7 @@ def update_task_version(item_id, version_id):
 @app.route('/api/dataset/<item_id>/head', methods=['PUT'])
 def set_task_head(item_id):
     try:
-        body = request.get_json() or {}
+        body = request.get_json(silent=True) or {}
         vid = body.get("versionId")
         if not vid:
             return jsonify({"error": "Missing 'versionId'"}), 400
@@ -466,6 +475,9 @@ def set_task_head(item_id):
         logger.exception(f"Failed to set head item_id={item_id} rid={getattr(g,'_rid','-')}")
         return jsonify({'error': f'Failed to set head: {str(e)}'}), 500
 
+# ------------------------------------------------------------------------------
+# Test runner proxy
+# ------------------------------------------------------------------------------
 @app.route("/api/run-tests", methods=['POST'])
 def run_tests_proxy():
     HF_API_URL = "https://hostpython.onrender.com/api/run-tests"
@@ -475,7 +487,7 @@ def run_tests_proxy():
             "error": "Backend API endpoint is not configured on the server."
         }), 500
     try:
-        incoming_data = request.get_json()
+        incoming_data = request.get_json(silent=True)
         if not incoming_data or "solution" not in incoming_data or "tests" not in incoming_data:
             return jsonify({
                 "success": False,
@@ -496,7 +508,7 @@ def run_tests_proxy():
         return app.response_class(
             response=response.content,
             status=response.status_code,
-            mimetype=response.headers['Content-Type']
+            mimetype=response.headers.get('Content-Type', 'application/json')
         )
     except requests.exceptions.Timeout:
         logger.error(f"Test runner timeout rid={getattr(g,'_rid','-')}")
@@ -512,16 +524,20 @@ def run_tests_proxy():
             "error": f"Failed to communicate with the test runner service: {e}"
         }), 502
 
+# ------------------------------------------------------------------------------
+# Topic suggestion (Gemini)
+# ------------------------------------------------------------------------------
 from google import genai
 client = genai.Client(api_key=os.getenv("API_KEY"))
 confJson = genai.types.GenerateContentConfig(
     response_mime_type="application/json",
 )
+
 @app.route('/api/suggest-topics', methods=['POST'])
 def suggest_topics():
     if not request.is_json:
         return jsonify({"error": "Request must be JSON"}), 400
-    data = request.get_json()
+    data = request.get_json(silent=True) or {}
     problem_prompt = data.get('prompt')
     solution_code = data.get('solution')
     if not problem_prompt or not solution_code:
@@ -563,17 +579,22 @@ def suggest_topics():
     """
     try:
         response = client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=prompt,
-                config=confJson
-            )
-        cleaned_response_text = response.text.strip().replace("```json", "").replace("```", "").strip()
+            model="gemini-2.5-flash",
+            contents=prompt,
+            config=confJson
+        )
+        cleaned_response_text = (response.text or "").strip().replace("```json", "").replace("```", "").strip()
         suggested_topics = json.loads(cleaned_response_text)
+        if not isinstance(suggested_topics, list):
+            raise ValueError("Model returned non-list JSON")
         return jsonify({"topics": suggested_topics})
     except Exception as e:
         logger.exception(f"Failed to generate or parse topics rid={getattr(g,'_rid','-')}")
         return jsonify({"error": "Failed to generate or parse topics from the model."}), 500
 
+# ------------------------------------------------------------------------------
+# Importers
+# ------------------------------------------------------------------------------
 @app.route('/api/dataset/import/csv', methods=['POST'])
 def import_dataset_csv():
     try:
@@ -614,7 +635,8 @@ def import_dataset_csv():
                     "time_complexity": r.get("time_complexity"),
                     "space_complexity": r.get("space_complexity"),
                     "notes": r.get("notes"),
-                    "group": r.get("group")
+                    "group": r.get("group"),
+                    "lastRunSuccessful": False
                 }
             meta = payload.get("metadata") or {}
             merged = {
@@ -631,7 +653,8 @@ def import_dataset_csv():
                 "time_complexity": meta.get("time_complexity", payload.get("time_complexity")),
                 "space_complexity": meta.get("space_complexity", payload.get("space_complexity")),
                 "group": payload.get("group"),
-                "notes": payload.get("notes", r.get("notes") or "")
+                "notes": payload.get("notes", r.get("notes") or ""),
+                "lastRunSuccessful": bool(payload.get("lastRunSuccessful", False)),
             }
             row = _row_from_generic_payload(merged, now)
             to_insert.append(row)
@@ -677,7 +700,8 @@ def import_dataset_jsonl():
                 "time_complexity": meta.get("time_complexity", obj.get("time_complexity")),
                 "space_complexity": meta.get("space_complexity", obj.get("space_complexity")),
                 "group": obj.get("group"),
-                "notes": obj.get("notes", "")
+                "notes": obj.get("notes", ""),
+                "lastRunSuccessful": bool(obj.get("lastRunSuccessful", False)),
             }
             row = _row_from_generic_payload(merged, now)
             to_insert.append(row)
@@ -690,49 +714,24 @@ def import_dataset_jsonl():
         logger.exception(f"Failed to import JSONL rid={getattr(g,'_rid','-')}")
         return jsonify({'error': f'Failed to import JSONL: {str(e)}'}), 500
 
+# ------------------------------------------------------------------------------
+# Internal helper used in update_dataset_item; keep it last to avoid confusion.
+# ------------------------------------------------------------------------------
+def _split_meta(payload):
+    """
+    Split a generic payload into (base, meta) pieces. Used during updates.
+    """
+    reserved = {"notes", "lastRunSuccessful", "createdAt", "updatedAt", "currentVersionId", "id"}
+    meta = {k: v for k, v in (payload or {}).items() if k not in reserved}
+    base = {
+        "notes": (payload or {}).get("notes", ""),
+        "lastRunSuccessful": bool((payload or {}).get("lastRunSuccessful", False)),
+        "currentVersionId": (payload or {}).get("currentVersionId", None),
+    }
+    return base, meta
+
+# ------------------------------------------------------------------------------
+# Entrypoint
+# ------------------------------------------------------------------------------
 if __name__ == '__main__':
-    def run_test_scenario(scenario_name, solution_code, test_code):
-        print(f"--- RUNNING SCENARIO: {scenario_name} ---")
-        with app.test_client() as client:
-            response = client.post('/api/run-tests',
-                                   data=json.dumps({
-                                       'solution': solution_code,
-                                       'tests': test_code
-                                   }),
-                                   content_type='application/json')
-            print("Status Code:", response.status_code)
-            print("Response JSON:")
-            response_data = response.get_json()
-            print(json.dumps(response_data, indent=2))
-            print("--- END OF SCENARIO ---\n")
-
-    passing_solution = "def add(a, b):\n    return a + b"
-    passing_tests = (
-        "def test_add_positive():\n"
-        "    assert add(2, 3) == 5\n\n"
-        "def test_add_negative():\n"
-        "    assert add(-1, -1) == -2"
-    )
-    run_test_scenario("SUCCESSFUL RUN", passing_solution, passing_tests)
-
-    failing_solution = "def add(a, b):\n    return a * b  # Bug: uses multiplication"
-    failing_tests = (
-        "def test_add_positive_fail():\n"
-        "    assert add(2, 3) == 5\n\n"
-        "def test_add_identity_pass():\n"
-        "    assert add(1, 5) == 5\n\n"
-        "def test_add_zero_fail():\n"
-        "    assert add(5, 0) == 5"
-    )
-    run_test_scenario("FAILING RUN", failing_solution, failing_tests)
-
-    syntax_error_solution = "def my_func():\n    return True"
-    syntax_error_tests = (
-        "def test_syntax():\n"
-        "    assert my_func() is True\n"
-        "    this is an invalid line"
-    )
-    run_test_scenario("SYNTAX ERROR IN TEST", syntax_error_solution, syntax_error_tests)
-
-    print("Starting Flask server for manual testing...")
     app.run(debug=True, host='127.0.0.1', port=5328)

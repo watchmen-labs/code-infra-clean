@@ -28,3 +28,20 @@ export interface Analytics {
 }
 
 export type SortKey = 'difficulty' | 'lastRunSuccessful' | 'createdAt';
+
+export interface TestResult {
+  success: boolean;
+  output: string;
+  error?: string;
+  timeout?: boolean;
+}
+
+export interface VersionNode {
+  id: string;
+  itemId?: string;
+  parentId?: string | null;
+  label?: string | null;
+  data?: Partial<DatasetItem>;
+  authorId?: string | null;
+  createdAt?: string;
+}
