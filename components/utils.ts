@@ -154,23 +154,31 @@ export const clearCommentsAndDocstrings = (code: string, language?: SupportedLan
 };
 
 export const calculateAnalytics = (data: DatasetItem[]): Analytics => {
+  const list: DatasetItem[] = Array.isArray(data)
+    ? data
+    : Array.isArray((data as any)?.items)
+      ? (data as any).items
+      : Array.isArray((data as any)?.data)
+        ? (data as any).data
+        : [];
+
   const analytics: Analytics = {
-    totalItems: data.length,
+    totalItems: list.length,
     byDifficulty: {},
     byTopic: {},
-    successfulRuns: data.filter(item => item.lastRunSuccessful).length,
-    itemsWithNotes: data.filter(item => item.notes && item.notes.trim()).length
-  }
+    successfulRuns: list.filter(item => item.lastRunSuccessful).length,
+    itemsWithNotes: list.filter(item => item.notes && item.notes.trim()).length
+  };
 
-  data.forEach(item => {
-    analytics.byDifficulty[item.difficulty] = (analytics.byDifficulty[item.difficulty] || 0) + 1
+  list.forEach(item => {
+    analytics.byDifficulty[item.difficulty] = (analytics.byDifficulty[item.difficulty] || 0) + 1;
     item.topics.forEach(topic => {
-      analytics.byTopic[topic] = (analytics.byTopic[topic] || 0) + 1
-    })
-  })
+      analytics.byTopic[topic] = (analytics.byTopic[topic] || 0) + 1;
+    });
+  });
 
-  return analytics
-}
+  return analytics;
+};
 
 export const executeExport = (
   items: DatasetItem[],

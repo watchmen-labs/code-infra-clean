@@ -16,6 +16,7 @@ export interface DatasetItem {
   lastRunSuccessful: boolean
   createdAt: string
   updatedAt: string
+  currentVersionId?: string | null
 }
 
 export interface Analytics {

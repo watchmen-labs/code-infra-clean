@@ -1,7 +1,5 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, g
 from flask_cors import CORS
-import firebase_admin
-from firebase_admin import credentials, firestore
 import os
 import tempfile
 import subprocess
@@ -11,131 +9,471 @@ import requests
 from datetime import datetime
 from dotenv import load_dotenv
 import xml.etree.ElementTree as ET
+from functools import wraps
+from supabase import create_client, Client
+import urllib.parse
+import logging
+import time
+import uuid
+from werkzeug.exceptions import HTTPException
+import io
+import csv
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+logger = logging.getLogger("api")
 
 app = Flask(__name__)
 CORS(app)
 
-# Load environment variables from .env file
 load_dotenv()
 
-# Initialize Firebase
-if not firebase_admin._apps:
-    if os.getenv('FIREBASE_PROJECT_ID'):
-        cred = credentials.Certificate({
-            "type": "service_account",
-            "project_id": os.getenv('FIREBASE_PROJECT_ID'),
-            "private_key": os.getenv('FIREBASE_PRIVATE_KEY', '').replace('\\n', '\n'),
-            "client_email": os.getenv('FIREBASE_CLIENT_EMAIL'),
-            "client_id": "",
-            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-            "token_uri": "https://oauth2.googleapis.com/token"
-        })
-        firebase_admin.initialize_app(cred)
-    else:
-        firebase_admin.initialize_app()
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_ANON_KEY")
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-db = firestore.client()
+@app.before_request
+def _log_request_start():
+    g._start_time = time.time()
+    g._rid = request.headers.get("X-Request-ID") or uuid.uuid4().hex
+
+@app.after_request
+def _log_request_end(response):
+    try:
+        duration_ms = (time.time() - getattr(g, "_start_time", time.time())) * 1000
+        uid = getattr(g, "user_id", None)
+        logger.info(
+            f"{request.method} {request.path} {response.status_code} {duration_ms:.2f}ms rid={getattr(g,'_rid','-')}" + (f" uid={uid}" if uid else "")
+        )
+    except Exception:
+        pass
+    return response
+
+@app.errorhandler(HTTPException)
+def _handle_http_exception(e):
+    logger.warning(f"HTTPException {e.code} {e.name} path={request.path} rid={getattr(g,'_rid','-')}")
+    return e
+
+@app.errorhandler(Exception)
+def _handle_unhandled_exception(e):
+    logger.exception(f"Unhandled exception path={request.path} rid={getattr(g,'_rid','-')}")
+    return jsonify({"error": "Internal Server Error"}), 500
+
+def get_current_user():
+    auth = request.headers.get("Authorization", "")
+    token = None
+    if auth.startswith("Bearer "):
+        token = auth.split(" ", 1)[1].strip()
+    if not token:
+        return None, None
+    try:
+        u = supabase.auth.get_user(token)
+        if getattr(u, "user", None) and getattr(u.user, "id", None):
+            return u.user.id, getattr(u.user, "email", None)
+    except Exception:
+        pass
+    try:
+        r = requests.get(f"{SUPABASE_URL}/auth/v1/user", headers={"Authorization": f"Bearer {token}", "apikey": SUPABASE_KEY}, timeout=15)
+        if r.status_code == 200:
+            j = r.json()
+            return j.get("id"), j.get("email")
+    except Exception:
+        pass
+    return None, None
+
+def auth_required(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        uid, email = get_current_user()
+        if not uid:
+            logger.warning(f"Unauthorized access to {request.path} rid={getattr(g,'_rid','-')}")
+            return jsonify({"error": "Unauthorized"}), 401
+        g.user_id = uid
+        g.user_email = email
+        return fn(*args, **kwargs)
+    return wrapper
+
+def _flatten_dataset_row(row):
+    meta = row.get("meta") or {}
+    out = {"id": row.get("id")}
+    out.update(meta)
+    out["notes"] = row.get("notes", "")
+    out["lastRunSuccessful"] = row.get("lastRunSuccessful", False)
+    out["createdAt"] = row.get("createdAt")
+    out["updatedAt"] = row.get("updatedAt")
+    if "currentVersionId" in row:
+        out["currentVersionId"] = row.get("currentVersionId")
+    return out
+
+def _split_meta(payload):
+    reserved = {"notes", "lastRunSuccessful", "createdAt", "updatedAt", "currentVersionId", "id"}
+    meta = {k: v for k, v in payload.items() if k not in reserved}
+    base = {
+        "notes": payload.get("notes", ""),
+        "lastRunSuccessful": payload.get("lastRunSuccessful", False),
+        "currentVersionId": payload.get("currentVersionId", None),
+    }
+    return base, meta
+
+def _normalize_topics(v):
+    if isinstance(v, list):
+        return [str(x) for x in v if str(x).strip() != ""]
+    if isinstance(v, str):
+        parts = [s.strip() for s in v.replace(",", ";").split(";")]
+        return [p for p in parts if p]
+    return []
+
+def _normalize_difficulty(v):
+    s = str(v or "").strip().lower()
+    if s == "hard":
+        return "Hard"
+    if s == "medium":
+        return "Medium"
+    return "Easy"
+
+def _flatten_dataset_row(row):
+    """
+    Convert the DB row into the shape expected by the frontend.
+
+    ✅ NEW: If the prompt (and friends) are stored as *top-level* columns, fall
+    back to those. This guarantees that `prompt`, `inputs`, … are always
+    populated even when older rows still use the legacy schema.
+    """
+    meta = row.get("meta") or {}
+    # ------------------------------------------------------------------⬇ NEW
+    for k in (
+        "prompt",
+        "inputs",
+        "outputs",
+        "unit_tests",
+        "solution",
+        "code_file",
+        "language",
+        "group",
+        "difficulty",
+        "topics",
+        "time_complexity",
+        "space_complexity",
+    ):
+        if not meta.get(k):
+            v = row.get(k)
+            if v is not None:
+                meta[k] = v
+    # ------------------------------------------------------------------⬆ NEW
+
+    out = {"id": row.get("id")}
+    out.update(meta)
+    out["notes"] = row.get("notes", "")
+    out["lastRunSuccessful"] = row.get("lastRunSuccessful", False)
+    out["createdAt"] = row.get("createdAt")
+    out["updatedAt"] = row.get("updatedAt")
+    if "currentVersionId" in row:
+        out["currentVersionId"] = row.get("currentVersionId")
+    return out
+
+
+def _row_from_generic_payload(payload, now):
+    """
+    Normalise an arbitrary task-like dict into the row we insert.
+
+    ✅ NEW: In addition to `meta`, we also fill the legacy *top-level* columns
+    (prompt, inputs, …) so that any NOT-NULL constraints are satisfied and old
+    client code keeps working.
+    """
+    # ----------------------------- meta -----------------------------------
+    meta = {
+        "prompt": payload.get("prompt", "") or "",
+        "inputs": payload.get("inputs", "") or "",
+        "outputs": payload.get("outputs", "") or "",
+        "unit_tests": payload.get("unit_tests", "") or "",
+        "solution": payload.get("solution")
+        or payload.get("reference_solution")
+        or "",
+        "code_file": payload.get("code_file", "") or "",
+        "language": payload.get("language"),
+        "group": payload.get("group"),
+        "time_complexity": payload.get("time_complexity", "") or "",
+        "space_complexity": payload.get("space_complexity", "") or "",
+        "topics": _normalize_topics(payload.get("topics")),
+        "difficulty": _normalize_difficulty(payload.get("difficulty")),
+    }
+
+    # -------------------------- top-level ---------------------------------
+    row = {
+        # legacy columns
+        "prompt": meta["prompt"],
+        "inputs": meta["inputs"],
+        "outputs": meta["outputs"],
+        "unit_tests": meta["unit_tests"],
+        "solution": meta["solution"],
+        "code_file": meta["code_file"],
+        "language": meta["language"],
+        "group": meta["group"],
+        "difficulty": meta["difficulty"],
+        "topics": meta["topics"],
+        "time_complexity": meta["time_complexity"],
+        "space_complexity": meta["space_complexity"],
+        # shared
+        "notes": payload.get("notes", ""),
+        "lastRunSuccessful": False,
+        "createdAt": now,
+        "updatedAt": now,
+        "currentVersionId": payload.get("currentVersionId"),
+        "meta": meta,
+    }
+    return row
+
+@app.route('/api/auth/user', methods=['GET'])
+def auth_user():
+    uid, email = get_current_user()
+    if not uid:
+        return jsonify({"authenticated": False}), 401
+    return jsonify({"authenticated": True, "user": {"id": uid, "email": email}})
+
+@app.route('/api/auth/start', methods=['GET'])
+def auth_start():
+    redirect_to = request.args.get("redirect_to") or os.getenv("SUPABASE_REDIRECT_URL") or (request.host_url.rstrip("/") + "/")
+    url = f"{SUPABASE_URL}/auth/v1/authorize?provider=google&redirect_to={urllib.parse.quote(redirect_to, safe='')}"
+    logger.info(f"Auth start redirect_to={redirect_to} rid={getattr(g,'_rid','-')}")
+    return jsonify({"url": url})
 
 @app.route('/api/dataset', methods=['GET'])
 def get_dataset():
     try:
-        docs = db.collection('dataset').order_by('createdAt', direction=firestore.Query.DESCENDING).stream()
-        items = []
-        for doc in docs:
-            data = doc.to_dict()
-            items.append({
-                'id': doc.id,
-                **data
-            })
+        res = supabase.table('dataset').select('*').order('createdAt', desc=True).execute()
+        rows = getattr(res, "data", []) or []
+        items = [_flatten_dataset_row(r) for r in rows]
         return jsonify(items)
     except Exception as e:
+        logger.exception(f"Failed to fetch dataset rid={getattr(g,'_rid','-')}")
         return jsonify({'error': f'Failed to fetch dataset: {str(e)}'}), 500
 
 @app.route('/api/dataset', methods=['POST'])
 def create_dataset_item():
     try:
-        data = request.json
+        data = request.json or {}
         now = datetime.now().isoformat()
-        
-        new_item = {
-            **data,
-            'notes': data.get('notes', ''),
-            'lastRunSuccessful': False,
-            'createdAt': now,
-            'updatedAt': now,
+        base, meta = _split_meta(data)
+        row = {
+            "notes": base["notes"],
+            "lastRunSuccessful": False,
+            "createdAt": now,
+            "updatedAt": now,
+            "currentVersionId": base.get("currentVersionId"),
+            "meta": meta
         }
-        
-        doc_ref = db.collection('dataset').add(new_item)
-        doc = doc_ref[1].get()
-        
-        return jsonify({
-            'id': doc.id,
-            **doc.to_dict()
-        })
+        res = supabase.table('dataset').insert(row).execute()
+        created = (getattr(res, "data", []) or [])[0]
+        return jsonify(_flatten_dataset_row(created))
     except Exception as e:
+        logger.exception(f"Failed to create dataset item rid={getattr(g,'_rid','-')}")
         return jsonify({'error': f'Failed to create dataset item: {str(e)}'}), 500
+
+@app.route('/api/dataset/_bulk', methods=['POST'])
+def bulk_create_dataset_items():
+    try:
+        data = request.get_json() or {}
+        items = data.get('items', [])
+        now = datetime.now().isoformat()
+        rows = []
+        for payload in items:
+            rows.append(_row_from_generic_payload(payload, now))
+        if not rows:
+            return jsonify([])
+        res = supabase.table('dataset').insert(rows).execute()
+        created = getattr(res, "data", []) or []
+        return jsonify([_flatten_dataset_row(r) for r in created])
+    except Exception as e:
+        logger.exception(f"Failed to bulk create dataset items rid={getattr(g,'_rid','-')}")
+        return jsonify({'error': f'Failed to bulk create dataset items: {str(e)}'}), 500
 
 @app.route('/api/dataset/<item_id>', methods=['GET'])
 def get_dataset_item(item_id):
     try:
-        doc = db.collection('dataset').document(item_id).get()
-        
-        if not doc.exists:
+        res = supabase.table('dataset').select('*').eq('id', item_id).single().execute()
+        row = getattr(res, "data", None)
+        if not row:
             return jsonify({'error': 'Item not found'}), 404
-        
-        return jsonify({
-            'id': doc.id,
-            **doc.to_dict()
-        })
+        return jsonify(_flatten_dataset_row(row))
     except Exception as e:
+        logger.exception(f"Failed to fetch dataset item id={item_id} rid={getattr(g,'_rid','-')}")
         return jsonify({'error': f'Failed to fetch dataset item: {str(e)}'}), 500
 
 @app.route('/api/dataset/<item_id>', methods=['PUT'])
 def update_dataset_item(item_id):
     try:
-        data = request.json
-        
+        data = request.json or {}
+        res = supabase.table('dataset').select('*').eq('id', item_id).single().execute()
+        existing = getattr(res, "data", None)
+        if not existing:
+            return jsonify({'error': 'Item not found'}), 404
+        _, incoming_meta = _split_meta(data)
+        merged_meta = {}
+        if isinstance(existing.get("meta"), dict):
+            merged_meta.update(existing.get("meta") or {})
+        merged_meta.update(incoming_meta)
         updated_item = {
-            'lastRunSuccessful': False,
-            **data,
-            'notes': data.get('notes', ''),
-            'updatedAt': datetime.now().isoformat(),
+            "lastRunSuccessful": False,
+            "notes": data.get('notes', existing.get("notes", "")),
+            "updatedAt": datetime.now().isoformat(),
+            "meta": merged_meta
         }
-        
-        db.collection('dataset').document(item_id).update(updated_item)
-        
-        doc = db.collection('dataset').document(item_id).get()
-        return jsonify({
-            'id': doc.id,
-            **doc.to_dict()
-        })
+        if "currentVersionId" in data:
+            updated_item["currentVersionId"] = data.get("currentVersionId")
+        supabase.table('dataset').update(updated_item).eq('id', item_id).execute()
+        res2 = supabase.table('dataset').select('*').eq('id', item_id).single().execute()
+        row = getattr(res2, "data", None)
+        return jsonify(_flatten_dataset_row(row))
     except Exception as e:
+        logger.exception(f"Failed to update dataset item id={item_id} rid={getattr(g,'_rid','-')}")
         return jsonify({'error': f'Failed to update dataset item: {str(e)}'}), 500
 
 @app.route('/api/dataset/<item_id>', methods=['DELETE'])
 def delete_dataset_item(item_id):
     try:
-        db.collection('dataset').document(item_id).delete()
+        supabase.table('dataset').delete().eq('id', item_id).execute()
         return jsonify({'success': True})
     except Exception as e:
+        logger.exception(f"Failed to delete dataset item id={item_id} rid={getattr(g,'_rid','-')}")
         return jsonify({'error': f'Failed to delete dataset item: {str(e)}'}), 500
+
+@app.route('/api/dataset/<item_id>/versions', methods=['GET'])
+def list_task_versions(item_id):
+    try:
+        res = supabase.table('task_versions').select('*').eq('item_id', item_id).order('created_at', desc=False).execute()
+        versions = getattr(res, "data", []) or []
+        nodes = {}
+        for v in versions:
+            nodes[v["id"]] = {
+                "id": v["id"],
+                "itemId": v.get("item_id"),
+                "parentId": v.get("parent_id"),
+                "data": v.get("data"),
+                "label": v.get("label"),
+                "authorId": v.get("author_id"),
+                "createdAt": v.get("created_at"),
+                "children": []
+            }
+        roots = []
+        for n in nodes.values():
+            pid = n["parentId"]
+            if pid and pid in nodes:
+                nodes[pid]["children"].append(n)
+            else:
+                roots.append(n)
+        return jsonify({"tree": roots, "flat": list(nodes.values())})
+    except Exception as e:
+        logger.exception(f"Failed to fetch versions item_id={item_id} rid={getattr(g,'_rid','-')}")
+        return jsonify({'error': f'Failed to fetch versions: {str(e)}'}), 500
+
+@app.route('/api/dataset/<item_id>/versions', methods=['POST'])
+def create_task_version(item_id):
+    try:
+        uid, email = get_current_user()
+        body = request.get_json() or {}
+        payload = body.get("data")
+        parent_id = body.get("parentId")
+        label = body.get("label")
+        if payload is None:
+            return jsonify({"error": "Missing 'data'"}), 400
+        row = {
+            "item_id": item_id,
+            "parent_id": parent_id,
+            "data": payload,
+            "label": label,
+            "author_id": uid,
+            "created_at": datetime.now().isoformat()
+        }
+        res = supabase.table('task_versions').insert(row).execute()
+        created = (getattr(res, "data", []) or [])[0]
+        return jsonify({
+            "id": created.get("id"),
+            "itemId": created.get("item_id"),
+            "parentId": created.get("parent_id"),
+            "data": created.get("data"),
+            "label": created.get("label"),
+            "authorId": created.get("author_id"),
+            "createdAt": created.get("created_at")
+        })
+    except Exception as e:
+        logger.exception(f"Failed to create version item_id={item_id} rid={getattr(g,'_rid','-')}")
+        return jsonify({'error': f'Failed to create version: {str(e)}'}), 500
+
+@app.route('/api/dataset/<item_id>/versions/<version_id>', methods=['GET'])
+def get_task_version(item_id, version_id):
+    try:
+        res = supabase.table('task_versions').select('*').eq('id', version_id).eq('item_id', item_id).single().execute()
+        v = getattr(res, "data", None)
+        if not v:
+            return jsonify({'error': 'Version not found'}), 404
+        return jsonify({
+            "id": v.get("id"),
+            "itemId": v.get("item_id"),
+            "parentId": v.get("parent_id"),
+            "data": v.get("data"),
+            "label": v.get("label"),
+            "authorId": v.get("author_id"),
+            "createdAt": v.get("created_at")
+        })
+    except Exception as e:
+        logger.exception(f"Failed to fetch version item_id={item_id} version_id={version_id} rid={getattr(g,'_rid','-')}")
+        return jsonify({'error': f'Failed to fetch version: {str(e)}'}), 500
+
+@app.route('/api/dataset/<item_id>/versions/<version_id>', methods=['PATCH'])
+def update_task_version(item_id, version_id):
+    try:
+        body = request.get_json() or {}
+        updates = {}
+        if "data" in body:
+            updates["data"] = body.get("data")
+        if "label" in body:
+            updates["label"] = body.get("label")
+        if not updates:
+            return jsonify({"error": "No updates provided"}), 400
+        supabase.table('task_versions').update(updates).eq('id', version_id).eq('item_id', item_id).execute()
+        res = supabase.table('task_versions').select('*').eq('id', version_id).single().execute()
+        v = getattr(res, "data", None)
+        return jsonify({
+            "id": v.get("id"),
+            "itemId": v.get("item_id"),
+            "parentId": v.get("parent_id"),
+            "data": v.get("data"),
+            "label": v.get("label"),
+            "authorId": v.get("author_id"),
+            "createdAt": v.get("created_at")
+        })
+    except Exception as e:
+        logger.exception(f"Failed to update version item_id={item_id} version_id={version_id} rid={getattr(g,'_rid','-')}")
+        return jsonify({'error': f'Failed to update version: {str(e)}'}), 500
+
+@app.route('/api/dataset/<item_id>/head', methods=['PUT'])
+def set_task_head(item_id):
+    try:
+        body = request.get_json() or {}
+        vid = body.get("versionId")
+        if not vid:
+            return jsonify({"error": "Missing 'versionId'"}), 400
+        supabase.table('dataset').update({"currentVersionId": vid, "updatedAt": datetime.now().isoformat()}).eq('id', item_id).execute()
+        res = supabase.table('dataset').select('*').eq('id', item_id).single().execute()
+        row = getattr(res, "data", None)
+        if not row:
+            return jsonify({'error': 'Item not found'}), 404
+        return jsonify(_flatten_dataset_row(row))
+    except Exception as e:
+        logger.exception(f"Failed to set head item_id={item_id} rid={getattr(g,'_rid','-')}")
+        return jsonify({'error': f'Failed to set head: {str(e)}'}), 500
 
 @app.route("/api/run-tests", methods=['POST'])
 def run_tests_proxy():
-    """
-    This function acts as a proxy. It receives a request, forwards it to the
-    Hugging Face API, and returns the response from Hugging Face.
-    """
-    # 1. Check if the HF_API_URL is configured
     HF_API_URL = "https://hostpython.onrender.com/api/run-tests"
     if not HF_API_URL:
-        # Return a 500 Internal Server Error if the backend is not configured
         return jsonify({
             "success": False,
             "error": "Backend API endpoint is not configured on the server."
         }), 500
-
-    # 2. Get the JSON payload from the incoming request
     try:
         incoming_data = request.get_json()
         if not incoming_data or "solution" not in incoming_data or "tests" not in incoming_data:
@@ -144,43 +482,35 @@ def run_tests_proxy():
                 "error": "Request body must be valid JSON and include 'solution' and 'tests' keys."
             }), 400
     except Exception:
+        logger.exception(f"Invalid JSON in request body rid={getattr(g,'_rid','-')}")
         return jsonify({"success": False, "error": "Invalid JSON in request body."}), 400
-
-    # 3. Make the POST request to the Hugging Face API
     try:
-        # Forward the exact same JSON payload to the Hugging Face API
+        logger.info(f"Proxying test run rid={getattr(g,'_rid','-')}")
         response = requests.post(
             HF_API_URL,
             json=incoming_data,
             headers={"Content-Type": "application/json"},
-            timeout=45  # Set a timeout slightly longer than your HF Space's timeout (30s)
+            timeout=45
         )
-        # This will raise an exception for 4xx/5xx server errors
         response.raise_for_status()
-
-        # 4. Return the exact response from the Hugging Face API
-        # We create a Flask response object using the content, status code,
-        # and headers from the Hugging Face response.
         return app.response_class(
             response=response.content,
             status=response.status_code,
             mimetype=response.headers['Content-Type']
         )
-
     except requests.exceptions.Timeout:
-        # The request to Hugging Face timed out
+        logger.error(f"Test runner timeout rid={getattr(g,'_rid','-')}")
         return jsonify({
             "success": False,
             "error": "The request to the test runner service timed out.",
             "timeout": True
-        }), 504  # 504 Gateway Timeout
-
+        }), 504
     except requests.exceptions.RequestException as e:
-        # This catches other network errors (connection failed, bad response from HF)
+        logger.exception(f"Failed to communicate with test runner rid={getattr(g,'_rid','-')}")
         return jsonify({
             "success": False,
             "error": f"Failed to communicate with the test runner service: {e}"
-        }), 502  # 502 Bad Gateway
+        }), 502
 
 from google import genai
 client = genai.Client(api_key=os.getenv("API_KEY"))
@@ -191,14 +521,11 @@ confJson = genai.types.GenerateContentConfig(
 def suggest_topics():
     if not request.is_json:
         return jsonify({"error": "Request must be JSON"}), 400
-
     data = request.get_json()
     problem_prompt = data.get('prompt')
     solution_code = data.get('solution')
-
     if not problem_prompt or not solution_code:
         return jsonify({"error": "Missing 'prompt' or 'solution' in request body"}), 400
-
     possible_topics = [
         "Array", "String", "Hash Table", "Dynamic Programming", "Math", "Sorting",
         "Greedy", "Depth-First Search", "Binary Search", "Database", "Matrix",
@@ -217,8 +544,6 @@ def suggest_topics():
         "Shell", "Reservoir Sampling", "Strongly Connected Component",
         "Eulerian Circuit", "Radix Sort", "Rejection Sampling", "Biconnected Component"
     ]
-
-
     prompt = f"""
     Analyze the following problem description and its solution code to identify the most relevant programming topics.
     From the provided list, please select the top 2 or 3 most applicable topics.
@@ -236,28 +561,137 @@ def suggest_topics():
 
     Return your answer as a JSON array of strings. For example: ["Topic1", "Topic2"]
     """
-
     try:
         response = client.models.generate_content(
                 model="gemini-2.5-flash",
                 contents=prompt,
                 config=confJson
             )
-        # Clean the response to extract the JSON part.
-        # The model might add backticks and 'json' specifier.
         cleaned_response_text = response.text.strip().replace("```json", "").replace("```", "").strip()
         suggested_topics = json.loads(cleaned_response_text)
         return jsonify({"topics": suggested_topics})
-
     except Exception as e:
-        # This will catch errors from the API call or JSON parsing
-        print(f"An error occurred: {e}")
+        logger.exception(f"Failed to generate or parse topics rid={getattr(g,'_rid','-')}")
         return jsonify({"error": "Failed to generate or parse topics from the model."}), 500
 
+@app.route('/api/dataset/import/csv', methods=['POST'])
+def import_dataset_csv():
+    try:
+        file = request.files.get('file')
+        if file:
+            text = file.read().decode('utf-8-sig')
+        else:
+            text = request.get_data(as_text=True)
+        if not text:
+            return jsonify({'error': 'No CSV content provided'}), 400
+        f = io.StringIO(text)
+        reader = csv.DictReader(f)
+        rows = list(reader)
+        now = datetime.now().isoformat()
+        to_insert = []
+        for r in rows:
+            payload = {}
+            if r.get('full_task_json'):
+                try:
+                    payload = json.loads(r.get('full_task_json'))
+                except Exception:
+                    try:
+                        payload = json.loads(r.get('full_task_json').replace('""', '"'))
+                    except Exception:
+                        payload = {}
+            if not payload:
+                payload = {
+                    "id": r.get("id"),
+                    "language": r.get("language"),
+                    "prompt": r.get("prompt"),
+                    "inputs": r.get("inputs"),
+                    "outputs": r.get("outputs"),
+                    "code_file": r.get("code_file"),
+                    "reference_solution": r.get("reference_solution") or r.get("solution"),
+                    "unit_tests": r.get("unit_tests"),
+                    "difficulty": r.get("difficulty"),
+                    "topics": r.get("topics"),
+                    "time_complexity": r.get("time_complexity"),
+                    "space_complexity": r.get("space_complexity"),
+                    "notes": r.get("notes"),
+                    "group": r.get("group")
+                }
+            meta = payload.get("metadata") or {}
+            merged = {
+                "language": payload.get("language"),
+                "prompt": payload.get("prompt"),
+                "inputs": payload.get("inputs"),
+                "outputs": payload.get("outputs"),
+                "code_file": payload.get("code_file"),
+                "reference_solution": payload.get("reference_solution"),
+                "solution": payload.get("solution"),
+                "unit_tests": payload.get("unit_tests"),
+                "difficulty": meta.get("difficulty", payload.get("difficulty")),
+                "topics": meta.get("topics", payload.get("topics")),
+                "time_complexity": meta.get("time_complexity", payload.get("time_complexity")),
+                "space_complexity": meta.get("space_complexity", payload.get("space_complexity")),
+                "group": payload.get("group"),
+                "notes": payload.get("notes", r.get("notes") or "")
+            }
+            row = _row_from_generic_payload(merged, now)
+            to_insert.append(row)
+        if not to_insert:
+            return jsonify([])
+        res = supabase.table('dataset').insert(to_insert).execute()
+        created = getattr(res, "data", []) or []
+        return jsonify([_flatten_dataset_row(x) for x in created])
+    except Exception as e:
+        logger.exception(f"Failed to import CSV rid={getattr(g,'_rid','-')}")
+        return jsonify({'error': f'Failed to import CSV: {str(e)}'}), 500
+
+@app.route('/api/dataset/import/jsonl', methods=['POST'])
+def import_dataset_jsonl():
+    try:
+        file = request.files.get('file')
+        if file:
+            text = file.read().decode('utf-8-sig')
+        else:
+            text = request.get_data(as_text=True)
+        if not text:
+            return jsonify({'error': 'No JSONL content provided'}), 400
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        now = datetime.now().isoformat()
+        to_insert = []
+        for line in lines:
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            meta = obj.get("metadata") or {}
+            merged = {
+                "language": obj.get("language"),
+                "prompt": obj.get("prompt"),
+                "inputs": obj.get("inputs"),
+                "outputs": obj.get("outputs"),
+                "code_file": obj.get("code_file"),
+                "reference_solution": obj.get("reference_solution"),
+                "solution": obj.get("solution"),
+                "unit_tests": obj.get("unit_tests"),
+                "difficulty": meta.get("difficulty", obj.get("difficulty")),
+                "topics": meta.get("topics", obj.get("topics")),
+                "time_complexity": meta.get("time_complexity", obj.get("time_complexity")),
+                "space_complexity": meta.get("space_complexity", obj.get("space_complexity")),
+                "group": obj.get("group"),
+                "notes": obj.get("notes", "")
+            }
+            row = _row_from_generic_payload(merged, now)
+            to_insert.append(row)
+        if not to_insert:
+            return jsonify([])
+        res = supabase.table('dataset').insert(to_insert).execute()
+        created = getattr(res, "data", []) or []
+        return jsonify([_flatten_dataset_row(x) for x in created])
+    except Exception as e:
+        logger.exception(f"Failed to import JSONL rid={getattr(g,'_rid','-')}")
+        return jsonify({'error': f'Failed to import JSONL: {str(e)}'}), 500
 
 if __name__ == '__main__':
     def run_test_scenario(scenario_name, solution_code, test_code):
-        """Helper function to run a test scenario using the Flask test client."""
         print(f"--- RUNNING SCENARIO: {scenario_name} ---")
         with app.test_client() as client:
             response = client.post('/api/run-tests',
@@ -272,7 +706,6 @@ if __name__ == '__main__':
             print(json.dumps(response_data, indent=2))
             print("--- END OF SCENARIO ---\n")
 
-    # Scenario 1: Correct solution, all tests should pass
     passing_solution = "def add(a, b):\n    return a + b"
     passing_tests = (
         "def test_add_positive():\n"
@@ -282,24 +715,22 @@ if __name__ == '__main__':
     )
     run_test_scenario("SUCCESSFUL RUN", passing_solution, passing_tests)
 
-    # Scenario 2: Incorrect solution, some tests should fail
     failing_solution = "def add(a, b):\n    return a * b  # Bug: uses multiplication"
     failing_tests = (
         "def test_add_positive_fail():\n"
-        "    assert add(2, 3) == 5\n\n"  # This will fail: 6 != 5
+        "    assert add(2, 3) == 5\n\n"
         "def test_add_identity_pass():\n"
-        "    assert add(1, 5) == 5\n\n"  # This will pass: 5 == 5
+        "    assert add(1, 5) == 5\n\n"
         "def test_add_zero_fail():\n"
-        "    assert add(5, 0) == 5"       # This will fail: 0 != 5
+        "    assert add(5, 0) == 5"
     )
     run_test_scenario("FAILING RUN", failing_solution, failing_tests)
 
-    # Scenario 3: Code with a syntax error
     syntax_error_solution = "def my_func():\n    return True"
     syntax_error_tests = (
         "def test_syntax():\n"
         "    assert my_func() is True\n"
-        "    this is an invalid line" # This will cause a syntax error
+        "    this is an invalid line"
     )
     run_test_scenario("SYNTAX ERROR IN TEST", syntax_error_solution, syntax_error_tests)
 
