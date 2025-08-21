@@ -35,10 +35,16 @@ CORS(app)
 load_dotenv()
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_ANON_KEY")
+SRK = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+SUPABASE_KEY = SRK or os.getenv("SUPABASE_ANON_KEY")
 if not SUPABASE_URL or not SUPABASE_KEY:
-    logger.warning("SUPABASE_URL or SUPABASE_* key missing; Supabase client may fail.")
+    logger.error("Missing SUPABASE_URL or key; Supabase client will fail.")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+if not SRK:
+    logger.warning(
+        "Running WITHOUT SUPABASE_SERVICE_ROLE_KEY. "
+        "If RLS is enabled on 'dataset', updates may be blocked (symptoms: currentVersionId stays null; dataset row never changes)."
+    )
 
 # ------------------------------------------------------------------------------
 # Request logging & error handling
@@ -117,6 +123,12 @@ def auth_required(fn):
 # ------------------------------------------------------------------------------
 # Normalize & transform helpers
 # ------------------------------------------------------------------------------
+TASK_KEYS = [
+    "prompt", "inputs", "outputs", "unit_tests", "solution",
+    "code_file", "language", "group", "difficulty", "topics",
+    "time_complexity", "space_complexity",
+]
+
 def _normalize_topics(v):
     if isinstance(v, list):
         return [str(x) for x in v if str(x).strip() != ""]
@@ -134,34 +146,12 @@ def _normalize_difficulty(v):
     return "Easy"
 
 def _flatten_dataset_row(row):
-    """
-    Convert the DB row into the shape expected by the frontend.
-
-    Ensures that `prompt`, `inputs`, etc. are always present by
-    falling back to top-level columns if `meta` is missing/legacy.
-    """
     meta = row.get("meta") or {}
-
-    # Backfill from top-level if missing in meta (legacy compatibility)
-    for k in (
-        "prompt",
-        "inputs",
-        "outputs",
-        "unit_tests",
-        "solution",
-        "code_file",
-        "language",
-        "group",
-        "difficulty",
-        "topics",
-        "time_complexity",
-        "space_complexity",
-    ):
+    for k in TASK_KEYS:
         if not meta.get(k):
             v = row.get(k)
             if v is not None:
                 meta[k] = v
-
     out = {"id": row.get("id")}
     out.update(meta)
     out["notes"] = row.get("notes", "") or ""
@@ -173,20 +163,12 @@ def _flatten_dataset_row(row):
     return out
 
 def _row_from_generic_payload(payload, now):
-    """
-    Normalize a task-like dict into the row we insert.
-
-    Writes both `meta` and top-level columns to satisfy any legacy NOT NULL
-    constraints and to keep dashboards/queries working.
-    """
     meta = {
         "prompt": payload.get("prompt", "") or "",
         "inputs": payload.get("inputs", "") or "",
         "outputs": payload.get("outputs", "") or "",
         "unit_tests": payload.get("unit_tests", "") or "",
-        "solution": payload.get("solution")
-        or payload.get("reference_solution")
-        or "",
+        "solution": payload.get("solution") or payload.get("reference_solution") or "",
         "code_file": payload.get("code_file", "") or "",
         "language": payload.get("language"),
         "group": payload.get("group"),
@@ -195,9 +177,7 @@ def _row_from_generic_payload(payload, now):
         "topics": _normalize_topics(payload.get("topics")),
         "difficulty": _normalize_difficulty(payload.get("difficulty")),
     }
-
     row = {
-        # sync to legacy top-level columns
         "prompt": meta["prompt"],
         "inputs": meta["inputs"],
         "outputs": meta["outputs"],
@@ -210,7 +190,6 @@ def _row_from_generic_payload(payload, now):
         "topics": meta["topics"],
         "time_complexity": meta["time_complexity"],
         "space_complexity": meta["space_complexity"],
-        # shared
         "notes": payload.get("notes", "") or "",
         "lastRunSuccessful": bool(payload.get("lastRunSuccessful", False)),
         "createdAt": now,
@@ -219,6 +198,72 @@ def _row_from_generic_payload(payload, now):
         "meta": meta,
     }
     return row
+
+def _split_meta(payload):
+    reserved = {"notes", "lastRunSuccessful", "createdAt", "updatedAt", "currentVersionId", "id"}
+    meta = {k: v for k, v in (payload or {}).items() if k not in reserved}
+    base = {
+        "notes": (payload or {}).get("notes", ""),
+        "lastRunSuccessful": bool((payload or {}).get("lastRunSuccessful", False)),
+        "currentVersionId": (payload or {}).get("currentVersionId", None),
+    }
+    return base, meta
+
+def _normalize_snapshot_fields(snapshot: dict) -> dict:
+    s = dict(snapshot or {})
+    s["topics"] = _normalize_topics(s.get("topics"))
+    if "difficulty" in s:
+        s["difficulty"] = _normalize_difficulty(s.get("difficulty"))
+    # ensure string fields are not None
+    for k in ["prompt", "inputs", "outputs", "unit_tests", "solution",
+              "code_file", "time_complexity", "space_complexity", "notes"]:
+        if k in s and s[k] is None:
+            s[k] = ""
+    return s
+
+def _merge_meta_with_snapshot(existing_meta: dict, snapshot: dict) -> dict:
+    merged = dict(existing_meta or {})
+    for k in TASK_KEYS:
+        if k in snapshot:
+            merged[k] = snapshot[k]
+    return merged
+
+def _ensure_rows_updated(resp, table: str, match_info: dict):
+    data = getattr(resp, "data", None)
+    if not data:
+        logger.error(
+            f"Supabase UPDATE affected 0 rows on '{table}'. "
+            f"Match={match_info}. This likely indicates RLS blocking or a wrong id."
+        )
+        raise RuntimeError("No rows updated (possible RLS or wrong id)")
+
+def _sync_dataset_with_snapshot(item_id: str, snapshot: dict, *, set_current_version_id: str | None = None):
+    """Persist a version snapshot into dataset (meta + top-level). Optionally set currentVersionId."""
+    # Fetch existing row
+    res = supabase.table('dataset').select('*').eq('id', item_id).single().execute()
+    existing = getattr(res, "data", None)
+    if not existing:
+        return None
+
+    norm = _normalize_snapshot_fields(snapshot)
+    merged_meta = _merge_meta_with_snapshot(existing.get("meta") or {}, norm)
+
+    top_level_updates = {k: merged_meta.get(k) for k in TASK_KEYS}
+    updates = {
+        **top_level_updates,
+        "meta": merged_meta,
+        "notes": norm.get("notes", existing.get("notes", "") or ""),
+        "updatedAt": datetime.now().isoformat(),
+    }
+    if set_current_version_id is not None:
+        updates["currentVersionId"] = set_current_version_id
+
+    resp = supabase.table('dataset').update(updates).eq('id', item_id).execute()
+    _ensure_rows_updated(resp, "dataset", {"id": item_id})
+
+    res2 = supabase.table('dataset').select('*').eq('id', item_id).single().execute()
+    row = getattr(res2, "data", None)
+    return _flatten_dataset_row(row) if row else None
 
 # ------------------------------------------------------------------------------
 # Auth endpoints
@@ -270,9 +315,7 @@ def bulk_create_dataset_items():
         data = request.get_json(silent=True) or {}
         items = data.get('items', [])
         now = datetime.now().isoformat()
-        rows = []
-        for payload in items:
-            rows.append(_row_from_generic_payload(payload, now))
+        rows = [_row_from_generic_payload(p, now) for p in items]
         if not rows:
             return jsonify([])
         res = supabase.table('dataset').insert(rows).execute()
@@ -303,7 +346,6 @@ def update_dataset_item(item_id):
         if not existing:
             return jsonify({'error': 'Item not found'}), 404
 
-        # Merge meta
         _, incoming_meta = _split_meta(data)
         merged_meta = (existing.get("meta") or {}).copy()
         merged_meta.update(incoming_meta or {})
@@ -311,25 +353,20 @@ def update_dataset_item(item_id):
         if "difficulty" in merged_meta:
             merged_meta["difficulty"] = _normalize_difficulty(merged_meta.get("difficulty"))
 
-        # sync selected fields to top-level
-        top_level_sync_keys = [
-            "prompt", "inputs", "outputs", "unit_tests", "solution",
-            "code_file", "language", "group", "difficulty", "topics",
-            "time_complexity", "space_complexity",
-        ]
-        tl_updates = {k: merged_meta.get(k) for k in top_level_sync_keys if k in merged_meta}
-
-        updated_item = {
+        tl_updates = {k: merged_meta.get(k) for k in TASK_KEYS if k in merged_meta}
+        updates = {
             "lastRunSuccessful": data.get('lastRunSuccessful', existing.get("lastRunSuccessful", False)),
-            "notes": data.get('notes', existing.get("notes", "")) or "",
+            "notes": data.get('notes', existing.get("notes", "") or ""),
             "updatedAt": datetime.now().isoformat(),
             "meta": merged_meta,
             **tl_updates,
         }
         if "currentVersionId" in data:
-            updated_item["currentVersionId"] = data.get("currentVersionId")
+            updates["currentVersionId"] = data.get("currentVersionId")
 
-        supabase.table('dataset').update(updated_item).eq('id', item_id).execute()
+        resp = supabase.table('dataset').update(updates).eq('id', item_id).execute()
+        _ensure_rows_updated(resp, "dataset", {"id": item_id})
+
         res2 = supabase.table('dataset').select('*').eq('id', item_id).single().execute()
         row = getattr(res2, "data", None)
         return jsonify(_flatten_dataset_row(row))
@@ -347,7 +384,7 @@ def delete_dataset_item(item_id):
         return jsonify({'error': f'Failed to delete dataset item: {str(e)}'}), 500
 
 # ------------------------------------------------------------------------------
-# Versions
+# Versions (+ atomic save)
 # ------------------------------------------------------------------------------
 @app.route('/api/dataset/<item_id>/versions', methods=['GET'])
 def list_task_versions(item_id):
@@ -386,6 +423,7 @@ def create_task_version(item_id):
         payload = body.get("data")
         parent_id = body.get("parentId")
         label = body.get("label")
+        make_head = bool(body.get("makeHead", False))
         if payload is None:
             return jsonify({"error": "Missing 'data'"}), 400
         row = {
@@ -398,6 +436,13 @@ def create_task_version(item_id):
         }
         res = supabase.table('task_versions').insert(row).execute()
         created = (getattr(res, "data", []) or [])[0]
+
+        # Optional: make this new version the head and sync dataset
+        if make_head:
+            updated = _sync_dataset_with_snapshot(item_id, payload, set_current_version_id=created.get("id"))
+            if not updated:
+                return jsonify({'error': 'Item not found'}), 404
+
         return jsonify({
             "id": created.get("id"),
             "itemId": created.get("item_id"),
@@ -436,15 +481,29 @@ def update_task_version(item_id, version_id):
     try:
         body = request.get_json(silent=True) or {}
         updates = {}
+        has_data_update = False
         if "data" in body:
             updates["data"] = body.get("data")
+            has_data_update = True
         if "label" in body:
             updates["label"] = body.get("label")
         if not updates:
             return jsonify({"error": "No updates provided"}), 400
-        supabase.table('task_versions').update(updates).eq('id', version_id).eq('item_id', item_id).execute()
+
+        resp = supabase.table('task_versions').update(updates).eq('id', version_id).eq('item_id', item_id).execute()
+        _ensure_rows_updated(resp, "task_versions", {"id": version_id, "item_id": item_id})
+
         res = supabase.table('task_versions').select('*').eq('id', version_id).single().execute()
         v = getattr(res, "data", None)
+
+        # If this version is the head and its data was updated -> sync row
+        if has_data_update:
+            ds_res = supabase.table('dataset').select('currentVersionId').eq('id', item_id).single().execute()
+            ds = getattr(ds_res, "data", None)
+            if ds and ds.get("currentVersionId") == version_id:
+                snapshot = updates.get("data") if "data" in updates else (v.get("data") if v else {})
+                _sync_dataset_with_snapshot(item_id, snapshot)
+
         return jsonify({
             "id": v.get("id"),
             "itemId": v.get("item_id"),
@@ -465,15 +524,73 @@ def set_task_head(item_id):
         vid = body.get("versionId")
         if not vid:
             return jsonify({"error": "Missing 'versionId'"}), 400
-        supabase.table('dataset').update({"currentVersionId": vid, "updatedAt": datetime.now().isoformat()}).eq('id', item_id).execute()
-        res = supabase.table('dataset').select('*').eq('id', item_id).single().execute()
-        row = getattr(res, "data", None)
-        if not row:
+
+        vres = supabase.table('task_versions').select('*').eq('id', vid).eq('item_id', item_id).single().execute()
+        v = getattr(vres, "data", None)
+        if not v:
+            return jsonify({'error': 'Version not found'}), 404
+        snapshot = v.get("data") or {}
+
+        updated = _sync_dataset_with_snapshot(item_id, snapshot, set_current_version_id=vid)
+        if not updated:
             return jsonify({'error': 'Item not found'}), 404
-        return jsonify(_flatten_dataset_row(row))
+        return jsonify(updated)
     except Exception as e:
         logger.exception(f"Failed to set head item_id={item_id} rid={getattr(g,'_rid','-')}")
         return jsonify({'error': f'Failed to set head: {str(e)}'}), 500
+
+@app.route('/api/dataset/<item_id>/save', methods=['POST'])
+def atomic_save(item_id):
+    """
+    Atomic path for the UI:
+      - If compressIntoVersionId provided: update that version's data/label
+      - Else: create a new version (optionally with parentId)
+      - In both cases: promote to head and mirror snapshot into dataset
+    """
+    try:
+        uid, _ = get_current_user()
+        body = request.get_json(silent=True) or {}
+        snapshot = body.get("data")
+        label = body.get("label")
+        parent_id = body.get("parentId")
+        compress_into = body.get("compressIntoVersionId")
+        if snapshot is None:
+            return jsonify({"error": "Missing 'data'"}), 400
+
+        now = datetime.now().isoformat()
+
+        if compress_into:
+            # Update existing version in place
+            patch = {"data": snapshot}
+            if label is not None:
+                patch["label"] = label
+            resp = supabase.table('task_versions').update(patch).eq('id', compress_into).eq('item_id', item_id).execute()
+            _ensure_rows_updated(resp, "task_versions", {"id": compress_into, "item_id": item_id})
+            version_id = compress_into
+        else:
+            # Create a new version
+            row = {
+                "item_id": item_id,
+                "parent_id": parent_id,
+                "data": snapshot,
+                "label": label,
+                "author_id": uid,
+                "created_at": now
+            }
+            res = supabase.table('task_versions').insert(row).execute()
+            created = (getattr(res, "data", []) or [])[0]
+            version_id = created.get("id")
+
+        # Promote to head + mirror dataset
+        dataset_row = _sync_dataset_with_snapshot(item_id, snapshot, set_current_version_id=version_id)
+        if not dataset_row:
+            return jsonify({'error': 'Item not found'}), 404
+
+        # Return dataset + chosen version id
+        return jsonify({"success": True, "versionId": version_id, "dataset": dataset_row})
+    except Exception as e:
+        logger.exception(f"Atomic save failed item_id={item_id} rid={getattr(g,'_rid','-')}")
+        return jsonify({'error': f'Atomic save failed: {str(e)}'}), 500
 
 # ------------------------------------------------------------------------------
 # Test runner proxy
@@ -713,22 +830,6 @@ def import_dataset_jsonl():
     except Exception as e:
         logger.exception(f"Failed to import JSONL rid={getattr(g,'_rid','-')}")
         return jsonify({'error': f'Failed to import JSONL: {str(e)}'}), 500
-
-# ------------------------------------------------------------------------------
-# Internal helper used in update_dataset_item; keep it last to avoid confusion.
-# ------------------------------------------------------------------------------
-def _split_meta(payload):
-    """
-    Split a generic payload into (base, meta) pieces. Used during updates.
-    """
-    reserved = {"notes", "lastRunSuccessful", "createdAt", "updatedAt", "currentVersionId", "id"}
-    meta = {k: v for k, v in (payload or {}).items() if k not in reserved}
-    base = {
-        "notes": (payload or {}).get("notes", ""),
-        "lastRunSuccessful": bool((payload or {}).get("lastRunSuccessful", False)),
-        "currentVersionId": (payload or {}).get("currentVersionId", None),
-    }
-    return base, meta
 
 # ------------------------------------------------------------------------------
 # Entrypoint
