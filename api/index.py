@@ -47,6 +47,27 @@ if not SRK:
     )
 
 # ------------------------------------------------------------------------------
+# Allowlist security (protect ALL DB routes)
+# ------------------------------------------------------------------------------
+# You can hardcode emails here OR set ALLOWED_EMAILS env (comma-separated).
+# If both are provided, ENV overrides this static set.
+STATIC_ALLOWED_EMAILS = set([
+    # "you@example.com",
+    # "teammate@example.com",
+])
+_env_allowed = os.getenv("ALLOWED_EMAILS", "").strip()
+if _env_allowed:
+    ALLOWED_EMAILS = {e.strip().lower() for e in _env_allowed.split(",") if e.strip()}
+else:
+    ALLOWED_EMAILS = {e.strip().lower() for e in STATIC_ALLOWED_EMAILS if e.strip()}
+
+def _is_allowed(email: str | None) -> bool:
+    # If the allowlist is empty, allow all authenticated users (non-breaking default).
+    if not ALLOWED_EMAILS:
+        return True
+    return (email or "").lower() in ALLOWED_EMAILS
+
+# ------------------------------------------------------------------------------
 # Request logging & error handling
 # ------------------------------------------------------------------------------
 @app.before_request
@@ -108,15 +129,25 @@ def get_current_user():
         pass
     return None, None
 
-def auth_required(fn):
+def _auth_and_set_g():
+    uid, email = get_current_user()
+    if not uid:
+        return None, None
+    g.user_id = uid
+    g.user_email = email
+    return uid, email
+
+def db_guard(fn):
+    """Require authentication + allowlist for any DB-touching route."""
     @wraps(fn)
     def wrapper(*args, **kwargs):
-        uid, email = get_current_user()
+        uid, email = _auth_and_set_g()
         if not uid:
             logger.warning(f"Unauthorized access to {request.path} rid={getattr(g,'_rid','-')}")
             return jsonify({"error": "Unauthorized"}), 401
-        g.user_id = uid
-        g.user_email = email
+        if not _is_allowed(email):
+            logger.warning(f"Forbidden (allowlist) path={request.path} email={email} rid={getattr(g,'_rid','-')}")
+            return jsonify({"error": "Forbidden"}), 403
         return fn(*args, **kwargs)
     return wrapper
 
@@ -237,9 +268,30 @@ def _ensure_rows_updated(resp, table: str, match_info: dict):
         )
         raise RuntimeError("No rows updated (possible RLS or wrong id)")
 
+def _snapshot_from_row(row: dict) -> dict:
+    """Build a version snapshot from a normalized dataset row dict produced by _row_from_generic_payload."""
+    meta = row.get("meta") or {}
+    snap = {
+        "prompt": meta.get("prompt", ""),
+        "inputs": meta.get("inputs", ""),
+        "outputs": meta.get("outputs", ""),
+        "code_file": meta.get("code_file", ""),
+        "unit_tests": meta.get("unit_tests", ""),
+        "solution": meta.get("solution", ""),
+        "time_complexity": meta.get("time_complexity", ""),
+        "space_complexity": meta.get("space_complexity", ""),
+        "topics": meta.get("topics", []),
+        "difficulty": meta.get("difficulty", "Easy"),
+        "notes": row.get("notes", "") or "",
+    }
+    return _normalize_snapshot_fields(snap)
+
 def _sync_dataset_with_snapshot(item_id: str, snapshot: dict, *, set_current_version_id: str | None = None):
-    """Persist a version snapshot into dataset (meta + top-level). Optionally set currentVersionId."""
-    # Fetch existing row
+    """
+    Persist a version snapshot into dataset (meta + top-level). Optionally set currentVersionId.
+    Optimized to avoid a post-update SELECT by computing the updated row in memory.
+    """
+    # Fetch existing row to preserve unknown meta keys and notes
     res = supabase.table('dataset').select('*').eq('id', item_id).single().execute()
     existing = getattr(res, "data", None)
     if not existing:
@@ -248,12 +300,13 @@ def _sync_dataset_with_snapshot(item_id: str, snapshot: dict, *, set_current_ver
     norm = _normalize_snapshot_fields(snapshot)
     merged_meta = _merge_meta_with_snapshot(existing.get("meta") or {}, norm)
 
+    now = datetime.now().isoformat()
     top_level_updates = {k: merged_meta.get(k) for k in TASK_KEYS}
     updates = {
         **top_level_updates,
         "meta": merged_meta,
         "notes": norm.get("notes", existing.get("notes", "") or ""),
-        "updatedAt": datetime.now().isoformat(),
+        "updatedAt": now,
     }
     if set_current_version_id is not None:
         updates["currentVersionId"] = set_current_version_id
@@ -261,12 +314,12 @@ def _sync_dataset_with_snapshot(item_id: str, snapshot: dict, *, set_current_ver
     resp = supabase.table('dataset').update(updates).eq('id', item_id).execute()
     _ensure_rows_updated(resp, "dataset", {"id": item_id})
 
-    res2 = supabase.table('dataset').select('*').eq('id', item_id).single().execute()
-    row = getattr(res2, "data", None)
-    return _flatten_dataset_row(row) if row else None
+    # Compose the updated row locally to avoid a second SELECT
+    virtual = {**existing, **updates}
+    return _flatten_dataset_row(virtual)
 
 # ------------------------------------------------------------------------------
-# Auth endpoints
+# Auth endpoints (left open so clients can sign in / discover their user)
 # ------------------------------------------------------------------------------
 @app.route('/api/auth/user', methods=['GET'])
 def auth_user():
@@ -283,9 +336,10 @@ def auth_start():
     return jsonify({"url": url})
 
 # ------------------------------------------------------------------------------
-# Dataset CRUD
+# Dataset CRUD (protected)
 # ------------------------------------------------------------------------------
 @app.route('/api/dataset', methods=['GET'])
+@db_guard
 def get_dataset():
     try:
         res = supabase.table('dataset').select('*').order('createdAt', desc=True).execute()
@@ -297,35 +351,107 @@ def get_dataset():
         return jsonify({'error': f'Failed to fetch dataset: {str(e)}'}), 500
 
 @app.route('/api/dataset', methods=['POST'])
+@db_guard
 def create_dataset_item():
+    """
+    Efficient create:
+      - (Optional) createInitialVersion=true: pre-generate dataset_id & version_id
+      - Insert dataset row with currentVersionId already set (1 call)
+      - Insert the initial version (1 call)
+    """
     try:
         data = request.get_json(silent=True) or {}
         now = datetime.now().isoformat()
+        create_initial = bool(data.get("createInitialVersion", False))
+        initial_label = (data.get("label") or data.get("initialLabel") or (g.user_email or "")).strip()
+
+        dataset_id = str(uuid.uuid4())
+        version_id = str(uuid.uuid4()) if create_initial else None
+
         row = _row_from_generic_payload(data, now)
+        row["id"] = dataset_id
+        if create_initial:
+            row["currentVersionId"] = version_id
+
+        # 1) Insert dataset row
         res = supabase.table('dataset').insert(row).execute()
         created = (getattr(res, "data", []) or [])[0]
-        return jsonify(_flatten_dataset_row(created))
+
+        # 2) Insert initial version (no stamp, editor = authenticated user via author_id)
+        if create_initial:
+            snapshot = _snapshot_from_row(row)
+            vrow = {
+                "id": version_id,
+                "item_id": dataset_id,
+                "parent_id": None,
+                "data": snapshot,
+                "label": initial_label,  # Client may send a formatted label; if not, we fall back to email string.
+                "author_id": g.user_id,
+                "created_at": now
+            }
+            supabase.table('task_versions').insert(vrow).execute()
+
+        return jsonify(_flatten_dataset_row({**created, **({"currentVersionId": version_id} if create_initial else {})}))
     except Exception as e:
         logger.exception(f"Failed to create dataset item rid={getattr(g,'_rid','-')}")
         return jsonify({'error': f'Failed to create dataset item: {str(e)}'}), 500
 
 @app.route('/api/dataset/_bulk', methods=['POST'])
+@db_guard
 def bulk_create_dataset_items():
+    """
+    Efficient bulk import:
+      - Pre-generate dataset ids and version ids
+      - Single insert into dataset (with currentVersionId prefilled)
+      - Single insert into task_versions (bulk)
+    """
     try:
-        data = request.get_json(silent=True) or {}
-        items = data.get('items', [])
-        now = datetime.now().isoformat()
-        rows = [_row_from_generic_payload(p, now) for p in items]
-        if not rows:
+        body = request.get_json(silent=True) or {}
+        items = body.get('items', [])
+        if not items:
             return jsonify([])
-        res = supabase.table('dataset').insert(rows).execute()
-        created = getattr(res, "data", []) or []
-        return jsonify([_flatten_dataset_row(r) for r in created])
+
+        now = datetime.now().isoformat()
+        ds_rows = []
+        v_rows = []
+
+        for payload in items:
+            dataset_id = str(uuid.uuid4())
+            version_id = str(uuid.uuid4())
+            row = _row_from_generic_payload(payload, now)
+            row["id"] = dataset_id
+            row["currentVersionId"] = version_id
+            ds_rows.append(row)
+
+            snapshot = _snapshot_from_row(row)
+            v_rows.append({
+                "id": version_id,
+                "item_id": dataset_id,
+                "parent_id": None,
+                "data": snapshot,
+                "label": (g.user_email or "").strip(),  # initialize editor to authenticated email (no stamps)
+                "author_id": g.user_id,
+                "created_at": now
+            })
+
+        # Insert dataset rows (1 call)
+        res = supabase.table('dataset').insert(ds_rows).execute()
+        created_ds = getattr(res, "data", []) or []
+
+        # Insert all versions (1 call)
+        if v_rows:
+            supabase.table('task_versions').insert(v_rows).execute()
+
+        flat = []
+        for r in created_ds:
+            flat.append(_flatten_dataset_row(r))
+        return jsonify(flat)
     except Exception as e:
         logger.exception(f"Failed to bulk create dataset items rid={getattr(g,'_rid','-')}")
         return jsonify({'error': f'Failed to bulk create dataset items: {str(e)}'}), 500
 
 @app.route('/api/dataset/<item_id>', methods=['GET'])
+@db_guard
 def get_dataset_item(item_id):
     try:
         res = supabase.table('dataset').select('*').eq('id', item_id).single().execute()
@@ -338,6 +464,7 @@ def get_dataset_item(item_id):
         return jsonify({'error': f'Failed to fetch dataset item: {str(e)}'}), 500
 
 @app.route('/api/dataset/<item_id>', methods=['PUT'])
+@db_guard
 def update_dataset_item(item_id):
     try:
         data = request.get_json(silent=True) or {}
@@ -367,14 +494,15 @@ def update_dataset_item(item_id):
         resp = supabase.table('dataset').update(updates).eq('id', item_id).execute()
         _ensure_rows_updated(resp, "dataset", {"id": item_id})
 
-        res2 = supabase.table('dataset').select('*').eq('id', item_id).single().execute()
-        row = getattr(res2, "data", None)
+        # Compose locally (avoid a second SELECT)
+        row = {**existing, **updates}
         return jsonify(_flatten_dataset_row(row))
     except Exception as e:
         logger.exception(f"Failed to update dataset item id={item_id} rid={getattr(g,'_rid','-')}")
         return jsonify({'error': f'Failed to update dataset item: {str(e)}'}), 500
 
 @app.route('/api/dataset/<item_id>', methods=['DELETE'])
+@db_guard
 def delete_dataset_item(item_id):
     try:
         supabase.table('dataset').delete().eq('id', item_id).execute()
@@ -384,9 +512,10 @@ def delete_dataset_item(item_id):
         return jsonify({'error': f'Failed to delete dataset item: {str(e)}'}), 500
 
 # ------------------------------------------------------------------------------
-# Versions (+ atomic save)
+# Versions (+ atomic save) (protected)
 # ------------------------------------------------------------------------------
 @app.route('/api/dataset/<item_id>/versions', methods=['GET'])
+@db_guard
 def list_task_versions(item_id):
     try:
         res = supabase.table('task_versions').select('*').eq('item_id', item_id).order('created_at', desc=False).execute()
@@ -416,9 +545,10 @@ def list_task_versions(item_id):
         return jsonify({'error': f'Failed to fetch versions: {str(e)}'}), 500
 
 @app.route('/api/dataset/<item_id>/versions', methods=['POST'])
+@db_guard
 def create_task_version(item_id):
     try:
-        uid, _ = get_current_user()
+        uid, _ = g.user_id, g.user_email
         body = request.get_json(silent=True) or {}
         payload = body.get("data")
         parent_id = body.get("parentId")
@@ -457,6 +587,7 @@ def create_task_version(item_id):
         return jsonify({'error': f'Failed to create version: {str(e)}'}), 500
 
 @app.route('/api/dataset/<item_id>/versions/<version_id>', methods=['GET'])
+@db_guard
 def get_task_version(item_id, version_id):
     try:
         res = supabase.table('task_versions').select('*').eq('id', version_id).eq('item_id', item_id).single().execute()
@@ -477,6 +608,7 @@ def get_task_version(item_id, version_id):
         return jsonify({'error': f'Failed to fetch version: {str(e)}'}), 500
 
 @app.route('/api/dataset/<item_id>/versions/<version_id>', methods=['PATCH', 'PUT'])
+@db_guard
 def update_task_version(item_id, version_id):
     try:
         body = request.get_json(silent=True) or {}
@@ -493,8 +625,17 @@ def update_task_version(item_id, version_id):
         resp = supabase.table('task_versions').update(updates).eq('id', version_id).eq('item_id', item_id).execute()
         _ensure_rows_updated(resp, "task_versions", {"id": version_id, "item_id": item_id})
 
-        res = supabase.table('task_versions').select('*').eq('id', version_id).single().execute()
-        v = getattr(res, "data", None)
+        # Use the returned row if available to avoid an extra SELECT
+        v = None
+        try:
+            arr = getattr(resp, "data", None)
+            if isinstance(arr, list) and arr:
+                v = arr[0]
+        except Exception:
+            v = None
+        if v is None:
+            sel = supabase.table('task_versions').select('*').eq('id', version_id).single().execute()
+            v = getattr(sel, "data", None)
 
         # If this version is the head and its data was updated -> sync row
         if has_data_update:
@@ -518,6 +659,7 @@ def update_task_version(item_id, version_id):
         return jsonify({'error': f'Failed to update version: {str(e)}'}), 500
 
 @app.route('/api/dataset/<item_id>/head', methods=['PUT'])
+@db_guard
 def set_task_head(item_id):
     try:
         body = request.get_json(silent=True) or {}
@@ -540,6 +682,7 @@ def set_task_head(item_id):
         return jsonify({'error': f'Failed to set head: {str(e)}'}), 500
 
 @app.route('/api/dataset/<item_id>/save', methods=['POST'])
+@db_guard
 def atomic_save(item_id):
     """
     Atomic path for the UI:
@@ -548,7 +691,7 @@ def atomic_save(item_id):
       - In both cases: promote to head and mirror snapshot into dataset
     """
     try:
-        uid, _ = get_current_user()
+        uid, _ = g.user_id, g.user_email
         body = request.get_json(silent=True) or {}
         snapshot = body.get("data")
         label = body.get("label")
@@ -567,6 +710,8 @@ def atomic_save(item_id):
             resp = supabase.table('task_versions').update(patch).eq('id', compress_into).eq('item_id', item_id).execute()
             _ensure_rows_updated(resp, "task_versions", {"id": compress_into, "item_id": item_id})
             version_id = compress_into
+            inserted = False
+            created_version = None
         else:
             # Create a new version
             row = {
@@ -580,6 +725,15 @@ def atomic_save(item_id):
             res = supabase.table('task_versions').insert(row).execute()
             created = (getattr(res, "data", []) or [])[0]
             version_id = created.get("id")
+            inserted = True
+            created_version = {
+                "id": created.get("id"),
+                "itemId": created.get("item_id"),
+                "parentId": created.get("parent_id"),
+                "label": created.get("label"),
+                "authorId": created.get("author_id"),
+                "createdAt": created.get("created_at"),
+            }
 
         # Promote to head + mirror dataset
         dataset_row = _sync_dataset_with_snapshot(item_id, snapshot, set_current_version_id=version_id)
@@ -587,15 +741,23 @@ def atomic_save(item_id):
             return jsonify({'error': 'Item not found'}), 404
 
         # Return dataset + chosen version id
-        return jsonify({"success": True, "versionId": version_id, "dataset": dataset_row})
+        return jsonify({
+            "success": True,
+            "versionId": version_id,
+            "dataset": dataset_row,
+            "inserted": inserted,
+            "version": created_version,
+            "label": label
+        })
     except Exception as e:
         logger.exception(f"Atomic save failed item_id={item_id} rid={getattr(g,'_rid','-')}")
         return jsonify({'error': f'Atomic save failed: {str(e)}'}), 500
 
 # ------------------------------------------------------------------------------
-# Test runner proxy
+# Test runner proxy (protected)
 # ------------------------------------------------------------------------------
 @app.route("/api/run-tests", methods=['POST'])
+@db_guard
 def run_tests_proxy():
     HF_API_URL = "https://hostpython.onrender.com/api/run-tests"
     if not HF_API_URL:
@@ -642,7 +804,7 @@ def run_tests_proxy():
         }), 502
 
 # ------------------------------------------------------------------------------
-# Topic suggestion (Gemini)
+# Topic suggestion (protected)
 # ------------------------------------------------------------------------------
 from google import genai
 client = genai.Client(api_key=os.getenv("API_KEY"))
@@ -651,6 +813,7 @@ confJson = genai.types.GenerateContentConfig(
 )
 
 @app.route('/api/suggest-topics', methods=['POST'])
+@db_guard
 def suggest_topics():
     if not request.is_json:
         return jsonify({"error": "Request must be JSON"}), 400
@@ -710,9 +873,10 @@ def suggest_topics():
         return jsonify({"error": "Failed to generate or parse topics from the model."}), 500
 
 # ------------------------------------------------------------------------------
-# Importers
+# Importers (protected) — also create initial versions efficiently
 # ------------------------------------------------------------------------------
 @app.route('/api/dataset/import/csv', methods=['POST'])
+@db_guard
 def import_dataset_csv():
     try:
         file = request.files.get('file')
@@ -722,11 +886,16 @@ def import_dataset_csv():
             text = request.get_data(as_text=True)
         if not text:
             return jsonify({'error': 'No CSV content provided'}), 400
+
         f = io.StringIO(text)
         reader = csv.DictReader(f)
         rows = list(reader)
+        if not rows:
+            return jsonify([])
+
         now = datetime.now().isoformat()
-        to_insert = []
+        ds_rows, v_rows = [], []
+
         for r in rows:
             payload = {}
             if r.get('full_task_json'):
@@ -773,18 +942,39 @@ def import_dataset_csv():
                 "notes": payload.get("notes", r.get("notes") or ""),
                 "lastRunSuccessful": bool(payload.get("lastRunSuccessful", False)),
             }
+            dataset_id = str(uuid.uuid4())
+            version_id = str(uuid.uuid4())
             row = _row_from_generic_payload(merged, now)
-            to_insert.append(row)
-        if not to_insert:
-            return jsonify([])
-        res = supabase.table('dataset').insert(to_insert).execute()
+            row["id"] = dataset_id
+            row["currentVersionId"] = version_id
+            ds_rows.append(row)
+
+            snapshot = _snapshot_from_row(row)
+            v_rows.append({
+                "id": version_id,
+                "item_id": dataset_id,
+                "parent_id": None,
+                "data": snapshot,
+                "label": (g.user_email or "").strip(),  # editor = importer email, no stamps
+                "author_id": g.user_id,
+                "created_at": now
+            })
+
+        # Insert dataset rows (1 call)
+        res = supabase.table('dataset').insert(ds_rows).execute()
         created = getattr(res, "data", []) or []
+
+        # Insert versions (1 call)
+        if v_rows:
+            supabase.table('task_versions').insert(v_rows).execute()
+
         return jsonify([_flatten_dataset_row(x) for x in created])
     except Exception as e:
         logger.exception(f"Failed to import CSV rid={getattr(g,'_rid','-')}")
         return jsonify({'error': f'Failed to import CSV: {str(e)}'}), 500
 
 @app.route('/api/dataset/import/jsonl', methods=['POST'])
+@db_guard
 def import_dataset_jsonl():
     try:
         file = request.files.get('file')
@@ -795,8 +985,12 @@ def import_dataset_jsonl():
         if not text:
             return jsonify({'error': 'No JSONL content provided'}), 400
         lines = [l.strip() for l in text.splitlines() if l.strip()]
+        if not lines:
+            return jsonify([])
+
         now = datetime.now().isoformat()
-        to_insert = []
+        ds_rows, v_rows = [], []
+
         for line in lines:
             try:
                 obj = json.loads(line)
@@ -820,12 +1014,35 @@ def import_dataset_jsonl():
                 "notes": obj.get("notes", ""),
                 "lastRunSuccessful": bool(obj.get("lastRunSuccessful", False)),
             }
+            dataset_id = str(uuid.uuid4())
+            version_id = str(uuid.uuid4())
             row = _row_from_generic_payload(merged, now)
-            to_insert.append(row)
-        if not to_insert:
+            row["id"] = dataset_id
+            row["currentVersionId"] = version_id
+            ds_rows.append(row)
+
+            snapshot = _snapshot_from_row(row)
+            v_rows.append({
+                "id": version_id,
+                "item_id": dataset_id,
+                "parent_id": None,
+                "data": snapshot,
+                "label": (g.user_email or "").strip(),
+                "author_id": g.user_id,
+                "created_at": now
+            })
+
+        if not ds_rows:
             return jsonify([])
-        res = supabase.table('dataset').insert(to_insert).execute()
+
+        # Insert dataset rows (1 call)
+        res = supabase.table('dataset').insert(ds_rows).execute()
         created = getattr(res, "data", []) or []
+
+        # Insert versions (1 call)
+        if v_rows:
+            supabase.table('task_versions').insert(v_rows).execute()
+
         return jsonify([_flatten_dataset_row(x) for x in created])
     except Exception as e:
         logger.exception(f"Failed to import JSONL rid={getattr(g,'_rid','-')}")

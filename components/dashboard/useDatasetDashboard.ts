@@ -190,7 +190,7 @@ export function useDatasetDashboard() {
         }
       }
 
-      // Fresh fetch (do NOT require authentication here)
+      // Fresh fetch (protected by allowlist on the server)
       const res = await fetch('/api/dataset', { cache: 'no-store', headers: { ...getAuthHeaders() } })
       if (res.ok) {
         const payload = await res.json()

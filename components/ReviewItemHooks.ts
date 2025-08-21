@@ -103,18 +103,8 @@ export function useReviewItem(id: string, router: any) {
           setCurrentIndex(idx);
           const fromList = filtered.find(x => x.id === id) as DatasetItem | undefined;
           if (fromList) setItem(fromList);
-          let fresh: DatasetItem | null = null;
-          try {
-            const itemRes = await fetch(`/api/dataset/${id}`, { cache: "no-store", headers: { ...(authHeaders || {}) } });
-            if (itemRes.ok) {
-              const itemData = await itemRes.json();
-              fresh = itemData;
-              setItem(itemData);
-              updateDatasetCacheItem(itemData);
-            }
-          } catch {}
-          const base = fresh || fromList || null;
-          await fetchVersions(id, base?.currentVersionId || null, true);
+          // Avoid a redundant GET for the same item; use the row from the list.
+          await fetchVersions(id, (fromList && fromList.currentVersionId) || null, true);
         }
       } finally {
         setLoading(false);
@@ -191,18 +181,54 @@ export function useReviewItem(id: string, router: any) {
     return false;
   };
 
-  const setHeadPointer = async (versionId: string) => {
-    if (!item) return;
-    const headRes = await fetch(`/api/dataset/${item.id}/head`, {
-      method: "PUT",
+  // Single-call atomic save helper: creates or updates a version, promotes to head, mirrors dataset
+  const atomicSave = async (snapshot: Partial<DatasetItem>, baseId: string | null, label: string) => {
+    if (!item) return null;
+    const base = versions.find(v => v.id === (baseId || ""));
+    const compressIntoVersionId = base && shouldCompressToBase(base) ? base.id : null;
+
+    const res = await fetch(`/api/dataset/${item.id}/save`, {
+      method: "POST",
       headers: { ...(authHeaders || {}), "Content-Type": "application/json" },
-      body: JSON.stringify({ versionId })
+      body: JSON.stringify({
+        data: snapshot,
+        label,
+        parentId: baseId,
+        compressIntoVersionId: compressIntoVersionId || undefined
+      })
     });
-    if (headRes.ok) {
-      const updated = await headRes.json();
-      setItem(updated);
-      updateDatasetCacheItem(updated);
+    if (!res.ok) return null;
+    const payload = await res.json();
+
+    // Mirror dataset row (already in response) to local state/cache
+    if (payload.dataset) {
+      setItem(payload.dataset);
+      updateDatasetCacheItem(payload.dataset);
     }
+
+    // Update local versions so we don't need a re-fetch
+    if (payload.inserted && payload.version) {
+      setVersions(prev => [
+        ...prev,
+        {
+          id: payload.version.id,
+          itemId: item.id,
+          parentId: payload.version.parentId,
+          data: snapshot,
+          label,
+          authorId: payload.version.authorId,
+          createdAt: payload.version.createdAt
+        }
+      ]);
+      setSelectedVersionId(payload.version.id);
+      setEditedFromVersionId(payload.version.id);
+    } else if (compressIntoVersionId) {
+      setVersions(prev => prev.map(v => v.id === compressIntoVersionId ? { ...v, data: snapshot, label } : v));
+      setSelectedVersionId(compressIntoVersionId);
+      setEditedFromVersionId(compressIntoVersionId);
+    }
+    setHasUnsavedChanges(false);
+    return payload;
   };
 
   const createVersionFrom = async (parentId: string | null, label?: string) => {
@@ -227,42 +253,11 @@ export function useReviewItem(id: string, router: any) {
     const editor = baseInfo.editor || identity(); // default editor = me if missing
     const mergedStamps = Array.from(new Set([...(baseInfo.stamps || []), ...(proposedInfo.stamps || [])]));
     const nextLabel = formatStandardLabel(editor, mergedStamps);
-    await safePutItem(snapshot);
-    const ok = await updateVersion(baseId || "", snapshot, nextLabel);
-    if (ok) {
-    await setHeadPointer(baseId|| "");
-    return { id: baseId, parentId: base?.parentId };
-    }
-    // Fallback: if PATCH failed (e.g., permissions), create a new version
-    // so the user still gets a saved version.
-    
-    const res = await fetch(`/api/dataset/${item.id}/versions`, {
-      method: "POST",
-      headers: { ...(authHeaders || {}), "Content-Type": "application/json" },
-      body: JSON.stringify({
-        data: snapshot,
-        parentId: baseId || null,
-        label: label || formatStandardLabel(identity(), [])
-      })
-    });
-    if (!res.ok) return null;
-    const created = await res.json();
-    setVersions(prev => [
-      ...prev,
-      {
-        id: created.id,
-        itemId: item.id,
-        parentId: created.parentId,
-        label: label || formatStandardLabel(identity(), []),
-        data: snapshot,
-        authorId: created.authorId,
-        createdAt: created.createdAt
-      }
-    ]);
-    setSelectedVersionId(created.id);
-    setEditedFromVersionId(created.id);
-    await setHeadPointer(created.id);
-    return created;
+
+    // Single atomic call handles (a) update existing version OR (b) create new version,
+    // (c) promote to head, and (d) mirror into dataset.
+    const payload = await atomicSave(snapshot, baseId || null, nextLabel);
+    return payload;
   };
 
   const updateVersionLabel = async (versionId: string, label: string) => {
@@ -279,47 +274,6 @@ export function useReviewItem(id: string, router: any) {
       return true;
     }
     return false;
-  };
-
-  const stampTask = async () => {
-    if (status !== "authenticated" || !user) return;
-    const me = identity();
-    if (!hasUnsavedChanges && selectedVersionId) {
-      const current = versions.find(v => v.id === selectedVersionId);
-       const info = parseStandardLabel(current?.label);
-      // If no editor set yet, default editor becomes me
-      const editor = info.editor || me;
-      const mergedStamps = Array.from(new Set([...(info.stamps || []), me]));
-      const nextLabel = formatStandardLabel(editor, mergedStamps);
-      const ok = await updateVersionLabel(selectedVersionId, nextLabel);
-      if (!ok) {
-        // Fallback: create a new stamped version from current
-        await createVersionFrom(selectedVersionId, nextLabel);
-      }
-      return;
-    }
-    // If there are unsaved changes, first create a version capturing them and stamp it.
-    await createVersionFrom(
-      editedFromVersionId || selectedVersionId || null,
-      formatStandardLabel(me, [me])
-    );
-  };
-
-  const safePutItem = async (body: Partial<DatasetItem>) => {
-    try {
-      const res = await fetch(`/api/dataset/${item?.id}`, {
-        method: "PUT",
-        headers: { ...(authHeaders || {}), "Content-Type": "application/json" },
-        body: JSON.stringify(body)
-      });
-      if (!res.ok) throw new Error("PUT failed");
-      const updated = await res.json();
-      setItem(updated);
-      updateDatasetCacheItem(updated);
-      return true;
-    } catch {
-      return false;
-    }
   };
 
   const handleSave = async () => {
@@ -340,9 +294,12 @@ export function useReviewItem(id: string, router: any) {
         notes: item.notes || "",
         lastRunSuccessful: item.lastRunSuccessful || false
       };
-      await safePutItem(payload);
       const me = identity();
-      await createVersionFrom(editedFromVersionId || selectedVersionId || null, formatStandardLabel(me, []));
+      await atomicSave(
+        payload,
+        editedFromVersionId || selectedVersionId || null,
+        formatStandardLabel(me, [])
+      );
       setHasUnsavedChanges(false);
     } finally {
       setSaving(false);
@@ -475,7 +432,29 @@ export function useReviewItem(id: string, router: any) {
 
     // actions
     loadVersion,
-    stampTask,
+    stampTask: async () => {
+      if (status !== "authenticated" || !user) return;
+      const me = identity();
+      if (!hasUnsavedChanges && selectedVersionId) {
+        const current = versions.find(v => v.id === selectedVersionId);
+        const info = parseStandardLabel(current?.label);
+        // If no editor set yet, default editor becomes me
+        const editor = info.editor || me;
+        const mergedStamps = Array.from(new Set([...(info.stamps || []), me]));
+        const nextLabel = formatStandardLabel(editor, mergedStamps);
+        const ok = await updateVersionLabel(selectedVersionId, nextLabel);
+        if (!ok) {
+          // Fallback: create a new stamped version from current (atomic)
+          await createVersionFrom(selectedVersionId, nextLabel);
+        }
+        return;
+      }
+      // If there are unsaved changes, first create a version capturing them and stamp it.
+      await createVersionFrom(
+        editedFromVersionId || selectedVersionId || null,
+        formatStandardLabel(me, [me])
+      );
+    },
     handleSave,
     handleDelete,
     runTests,

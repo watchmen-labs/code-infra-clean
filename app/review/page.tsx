@@ -14,7 +14,7 @@ import Link from 'next/link'
 import TestExecutionPanel from '@/components/TestExecutionPanel'
 import CodeEditorPanel from '@/components/CodeEditorPanel'
 import TopicsEditor from '@/components/TopicsEditor'
-import { clearCommentsAndDocstrings } from '@/components/utils'
+import { clearCommentsAndDocstrings, formatStandardLabel } from '@/components/utils'
 import { useAutoResize } from '@/components/useAutoResize'
 import { DatasetItem } from '@/components/types'
 import { useAuth } from '@/components/auth-context'
@@ -30,13 +30,12 @@ interface TestResult {
 
 export default function NewReview() {
   const router = useRouter()
-  const { headers: authHeaders } = useAuth()
+  const { headers: authHeaders, user } = useAuth()
   const [saving, setSaving] = useState(false)
   const [running, setRunning] = useState(false)
   const [testResult, setTestResult] = useState<TestResult | null>(null)
   const [newTopic, setNewTopic] = useState('')
   const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false)
-  const [initialVersionLabel, setInitialVersionLabel] = useState('v1')
   const [item, setItem] = useState<NewDatasetItem>({
     prompt: '',
     unit_tests: '',
@@ -55,39 +54,23 @@ export default function NewReview() {
   const handleSave = async () => {
     setSaving(true)
     try {
+      // Label: initialize editor to authenticated email; stamps = []
+      const editor = (user?.email || user?.id || '').trim()
+      const initialLabel = formatStandardLabel(editor, [])
+
       const response = await fetch('/api/dataset', {
         method: 'POST',
         headers: { ...authHeaders(), 'Content-Type': 'application/json' },
-        body: JSON.stringify(item),
+        body: JSON.stringify({
+          ...item,
+          createInitialVersion: true,
+          label: initialLabel
+        }),
       })
       if (response.ok) {
         const newItem = await response.json()
-        const snapshot = {
-          prompt: item.prompt || '',
-          inputs: item.inputs || '',
-          outputs: item.outputs || '',
-          code_file: item.code_file || '',
-          unit_tests: item.unit_tests || '',
-          solution: item.solution || '',
-          time_complexity: item.time_complexity || '',
-          space_complexity: item.space_complexity || '',
-          topics: item.topics || [],
-          difficulty: item.difficulty || 'Easy',
-          notes: item.notes || ''
-        }
-        const vRes = await fetch(`/api/dataset/${newItem.id}/versions`, {
-          method: 'POST',
-          headers: { ...authHeaders(), 'Content-Type': 'application/json' },
-          body: JSON.stringify({ data: snapshot, parentId: null, label: initialVersionLabel || 'v1' })
-        })
-        if (vRes.ok) {
-          const created = await vRes.json()
-          await fetch(`/api/dataset/${newItem.id}/head`, {
-            method: 'PUT',
-            headers: { ...authHeaders(), 'Content-Type': 'application/json' },
-            body: JSON.stringify({ versionId: created.id })
-          })
-        }
+
+        // Update session cache
         try {
           const raw = sessionStorage.getItem('dataset:all')
           if (raw) {
@@ -98,6 +81,7 @@ export default function NewReview() {
             }
           }
         } catch {}
+
         router.push(`/review/${newItem.id}`)
       }
     } finally {
@@ -216,10 +200,6 @@ export default function NewReview() {
             <div>
               <Label>Topics</Label>
               <TopicsEditor topics={item.topics} newTopic={newTopic} setNewTopic={setNewTopic} onAddTopic={addTopic} onRemoveTopic={removeTopic} />
-            </div>
-            <div>
-              <Label htmlFor="initial_version_label">Initial Version Label</Label>
-              <Input id="initial_version_label" placeholder="v1" value={initialVersionLabel} onChange={(e) => setInitialVersionLabel(e.target.value)} />
             </div>
           </CardContent>
         </Card>
