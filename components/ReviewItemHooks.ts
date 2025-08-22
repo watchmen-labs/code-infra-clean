@@ -11,7 +11,7 @@ const TTL_MS = 60_000;
 const DS_KEY = "dataset:all";
 
 export function useReviewItem(id: string, router: any) {
-  const { user, status, headers: authHeaders } = useAuth();
+  const { user, status, headers: getAuthHeaders } = useAuth();
 
   const [groupContext, setGroupContext] = useState<{ group: string | null; groupName: string | null; }>({ group: null, groupName: null });
   const [item, setItem] = useState<DatasetItem | null>(null);
@@ -38,7 +38,7 @@ export function useReviewItem(id: string, router: any) {
   const loadDatasetList = async (): Promise<DatasetItem[]> => {
     const cached = readCache(DS_KEY, TTL_MS);
     if (cached) return cached as DatasetItem[];
-    const res = await fetch("/api/dataset", { cache: "no-store", headers: { ...(authHeaders || {}) } });
+    const res = await fetch("/api/dataset", { cache: "no-store", headers: { ...(getAuthHeaders() || {}) } });
     const data = await res.json();
     if (Array.isArray(data)) writeCache(DS_KEY, data);
     return data;
@@ -68,7 +68,7 @@ export function useReviewItem(id: string, router: any) {
   const fetchVersions = async (itemId: string, headId: string | null, preloadIntoEditor: boolean) => {
     const res = await fetch(`/api/dataset/${itemId}/versions`, {
       cache: "no-store",
-      headers: { ...(authHeaders || {}) }
+      headers: { ...(getAuthHeaders() || {}) }
     });
     if (!res.ok) return;
     const data = await res.json();
@@ -112,7 +112,7 @@ export function useReviewItem(id: string, router: any) {
     };
     init();
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [id, router, authHeaders]);
+  }, [id, router]);
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -142,7 +142,7 @@ export function useReviewItem(id: string, router: any) {
     }
     const res = await fetch(`/api/dataset/${id}/versions/${versionId}`, {
       cache: "no-store",
-      headers: { ...(authHeaders || {}) }
+      headers: { ...(getAuthHeaders() || {}) }
     });
     if (!res.ok) return;
     const v = await res.json();
@@ -157,7 +157,7 @@ export function useReviewItem(id: string, router: any) {
     if (!item) return null;
     const res = await fetch(`/api/dataset/${item.id}/versions/${versionId}`, {
       method: "PATCH",
-      headers: { ...(authHeaders || {}), "Content-Type": "application/json" },
+      headers: { ...(getAuthHeaders() || {}), "Content-Type": "application/json" },
       body: JSON.stringify({ data, label })
     });
     if (!res.ok) {
@@ -189,7 +189,7 @@ export function useReviewItem(id: string, router: any) {
 
     const res = await fetch(`/api/dataset/${item.id}/save`, {
       method: "POST",
-      headers: { ...(authHeaders || {}), "Content-Type": "application/json" },
+      headers: { ...(getAuthHeaders() || {}), "Content-Type": "application/json" },
       body: JSON.stringify({
         data: snapshot,
         label,
@@ -264,7 +264,7 @@ export function useReviewItem(id: string, router: any) {
     if (!item) return;
     const res = await fetch(`/api/dataset/${item.id}/versions/${versionId}`, {
       method: "PATCH",
-      headers: { ...(authHeaders || {}), "Content-Type": "application/json" },
+      headers: { ...(getAuthHeaders() || {}), "Content-Type": "application/json" },
       body: JSON.stringify({ label })
     });
     if (res.ok) {
@@ -309,7 +309,7 @@ export function useReviewItem(id: string, router: any) {
   const handleDelete = async () => {
     if (!item || !confirm("Are you sure you want to delete this item?")) return;
     try {
-      const response = await fetch(`/api/dataset/${item.id}`, { method: "DELETE", headers: { ...(authHeaders || {}) } });
+      const response = await fetch(`/api/dataset/${item.id}`, { method: "DELETE", headers: { ...(getAuthHeaders() || {}) } });
       if (response.ok) {
         const cached = readCache(DS_KEY, TTL_MS);
         if (cached && Array.isArray(cached)) {
@@ -327,7 +327,7 @@ export function useReviewItem(id: string, router: any) {
     try {
       const response = await fetch("/api/run-tests", {
         method: "POST",
-        headers: { ...(authHeaders || {}), "Content-Type": "application/json" },
+        headers: { ...(getAuthHeaders() || {}), "Content-Type": "application/json" },
         body: JSON.stringify({ solution: item.solution, tests: item.unit_tests })
       });
       const result = await response.json();
@@ -378,7 +378,7 @@ export function useReviewItem(id: string, router: any) {
     try {
       const response = await fetch("/api/suggest-topics", {
         method: "POST",
-        headers: { ...(authHeaders || {}), "Content-Type": "application/json" },
+        headers: { ...(getAuthHeaders() || {}), "Content-Type": "application/json" },
         body: JSON.stringify({ prompt: item.prompt, solution: item.solution })
       });
       if (!response.ok) throw new Error();

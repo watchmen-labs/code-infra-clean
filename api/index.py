@@ -107,15 +107,15 @@ def get_current_user():
     if auth.startswith("Bearer "):
         token = auth.split(" ", 1)[1].strip()
     if not token:
-        return None, None
+        return None, None, None
     # Try Python client
     try:
         u = supabase.auth.get_user(token)
         if getattr(u, "user", None) and getattr(u.user, "id", None):
-            return u.user.id, getattr(u.user, "email", None)
+            return u.user.id, getattr(u.user, "email", None), token
     except Exception:
         pass
-    # Fallback raw HTTP (service key)
+    # Fallback raw HTTP
     try:
         r = requests.get(
             f"{SUPABASE_URL}/auth/v1/user",
@@ -124,31 +124,43 @@ def get_current_user():
         )
         if r.status_code == 200:
             j = r.json()
-            return j.get("id"), j.get("email")
+            return j.get("id"), j.get("email"), token
     except Exception:
         pass
-    return None, None
+    return None, None, None
 
 def _auth_and_set_g():
-    uid, email = get_current_user()
+    uid, email, token = get_current_user()
     if not uid:
-        return None, None
+        return None, None, None
     g.user_id = uid
     g.user_email = email
-    return uid, email
+    g._jwt = token
+    try:
+        # Tell PostgREST to run as this user (RLS will see their uid)
+        supabase.postgrest.auth(token)
+    except Exception:
+        logger.warning("Failed to bind JWT to PostgREST")
+    return uid, email, token
 
 def db_guard(fn):
-    """Require authentication + allowlist for any DB-touching route."""
     @wraps(fn)
     def wrapper(*args, **kwargs):
-        uid, email = _auth_and_set_g()
+        uid, email, token = _auth_and_set_g()
         if not uid:
             logger.warning(f"Unauthorized access to {request.path} rid={getattr(g,'_rid','-')}")
             return jsonify({"error": "Unauthorized"}), 401
         if not _is_allowed(email):
             logger.warning(f"Forbidden (allowlist) path={request.path} email={email} rid={getattr(g,'_rid','-')}")
             return jsonify({"error": "Forbidden"}), 403
-        return fn(*args, **kwargs)
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            # Avoid cross-request header leakage on the global client
+            try:
+                supabase.postgrest.auth(None)
+            except Exception:
+                pass
     return wrapper
 
 # ------------------------------------------------------------------------------
@@ -225,7 +237,7 @@ def _row_from_generic_payload(payload, now):
         "lastRunSuccessful": bool(payload.get("lastRunSuccessful", False)),
         "createdAt": now,
         "updatedAt": now,
-        "currentVersionId": payload.get("currentVersionId"),
+        # "currentVersionId": payload.get("currentVersionId"),
         "meta": meta,
     }
     return row
@@ -323,7 +335,7 @@ def _sync_dataset_with_snapshot(item_id: str, snapshot: dict, *, set_current_ver
 # ------------------------------------------------------------------------------
 @app.route('/api/auth/user', methods=['GET'])
 def auth_user():
-    uid, email = get_current_user()
+    uid, email,_ = get_current_user()
     if not uid:
         return jsonify({"authenticated": False}), 401
     return jsonify({"authenticated": True, "user": {"id": uid, "email": email}})
@@ -370,14 +382,15 @@ def create_dataset_item():
 
         row = _row_from_generic_payload(data, now)
         row["id"] = dataset_id
-        if create_initial:
-            row["currentVersionId"] = version_id
 
+        # ✅ Do NOT set currentVersionId on the initial insert (and ignore any client-sent value)
+        row.pop("currentVersionId", None)
+  
         # 1) Insert dataset row
         res = supabase.table('dataset').insert(row).execute()
         created = (getattr(res, "data", []) or [])[0]
 
-        # 2) Insert initial version (no stamp, editor = authenticated user via author_id)
+        # 2) Insert initial version (after dataset exists)
         if create_initial:
             snapshot = _snapshot_from_row(row)
             vrow = {
@@ -385,13 +398,19 @@ def create_dataset_item():
                 "item_id": dataset_id,
                 "parent_id": None,
                 "data": snapshot,
-                "label": initial_label,  # Client may send a formatted label; if not, we fall back to email string.
+                "label": initial_label,
                 "author_id": g.user_id,
                 "created_at": now
             }
             supabase.table('task_versions').insert(vrow).execute()
 
-        return jsonify(_flatten_dataset_row({**created, **({"currentVersionId": version_id} if create_initial else {})}))
+            # 3) Now that the version exists, set it as head and mirror snapshot if desired
+            # This keeps dataset meta/top-level in sync, and safely sets currentVersionId.
+            _sync_dataset_with_snapshot(dataset_id, snapshot, set_current_version_id=version_id)
+
+        # Respond with the flattened row. If you want to avoid a re-select, compose it locally:
+        resp_row = created if not create_initial else {**created, "currentVersionId": version_id}
+        return jsonify(_flatten_dataset_row(resp_row))
     except Exception as e:
         logger.exception(f"Failed to create dataset item rid={getattr(g,'_rid','-')}")
         return jsonify({'error': f'Failed to create dataset item: {str(e)}'}), 500
