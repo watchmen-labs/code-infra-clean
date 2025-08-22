@@ -939,8 +939,8 @@ def _compute_stamp_path_for_item(versions: dict, head_id: str | None) -> tuple[s
 
     if not path_segments:
         return "none", []
-    segment_strings = list(reversed([", ".join(seg) for seg in path_segments]))
-    return " -> ".join(segment_strings), path_segments
+    segment_strings = [", ".join(seg) for seg in path_segments]
+    return " <- ".join(segment_strings), path_segments
 
 # ------------------------------------------------------------------------------
 # Stamp paths (batch) (protected)
