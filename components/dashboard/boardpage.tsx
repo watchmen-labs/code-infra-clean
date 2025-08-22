@@ -16,6 +16,8 @@ export default function DashboardPage() {
     items, analytics, loading,
     selectedIds, sortConfig, activeGroup, uniqueGroups, sortedItems,
 
+    stampPaths,
+
     // state setters
     setSelectedIds, setSortConfig, setActiveGroup,
 
@@ -76,6 +78,7 @@ export default function DashboardPage() {
         onSelectAll={handleSelectAllClick}
         onSort={handleSort}
         onAssignGroup={handleAssignGroup}
+        stampPaths={stampPaths}
       />
     </div>
   )

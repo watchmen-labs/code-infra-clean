@@ -173,14 +173,21 @@ export function useReviewItem(id: string, router: any) {
   };
 
   const shouldCompressToBase = (base: VersionNode | undefined | null) => {
-    if (!base || status !== "authenticated" || !user) return false;
+    // Only allow "in-place" updates when:
+    // 1) we're authenticated
+    // 2) base exists AND is the current head
+    // 3) the same editor is making a back-to-back edit (no credit stealing)
+    if (!item || !base || status !== "authenticated" || !user) return false;
+    if (base.id !== item.currentVersionId) return false; // never compress non-head or branched nodes
+
     const me = identity();
     const info = parseStandardLabel(base.label);
-    if (info.editor && info.editor === me) return true;
-    if (!info.editor && base.authorId && (base.authorId === user.id)) return true;
-    return false;
-  };
+    const sameEditor =
+        (info.editor && info.editor === me) ||
+        (!info.editor && base.authorId && base.authorId === user.id);
 
+    return !!sameEditor;
+    };
   // Single-call atomic save helper: creates or updates a version, promotes to head, mirrors dataset
   const atomicSave = async (snapshot: Partial<DatasetItem>, baseId: string | null, label: string) => {
     if (!item) return null;
@@ -250,8 +257,17 @@ export function useReviewItem(id: string, router: any) {
     const base = versions.find(v => v.id === baseId) || null;
     const baseInfo = parseStandardLabel(base?.label);
     const proposedInfo = parseStandardLabel(label || "");
-    const editor = baseInfo.editor || identity(); // default editor = me if missing
-    const mergedStamps = Array.from(new Set([...(baseInfo.stamps || []), ...(proposedInfo.stamps || [])]));
+
+    // Prefer the explicitly provided editor (e.g., when saving or stamping),
+    // then fall back to the base editor, then finally me.
+    const editor = proposedInfo.editor || baseInfo.editor || identity();
+
+    // Merge stamps (set makes it idempotent). We do NOT force the previous
+    // editor into stamps unless they had already stamped.
+    const mergedStamps = Array.from(
+    new Set([...(baseInfo.stamps || []), ...(proposedInfo.stamps || [])])
+    );
+
     const nextLabel = formatStandardLabel(editor, mergedStamps);
 
     // Single atomic call handles (a) update existing version OR (b) create new version,
@@ -433,28 +449,60 @@ export function useReviewItem(id: string, router: any) {
     // actions
     loadVersion,
     stampTask: async () => {
-      if (status !== "authenticated" || !user) return;
-      const me = identity();
-      if (!hasUnsavedChanges && selectedVersionId) {
-        const current = versions.find(v => v.id === selectedVersionId);
-        const info = parseStandardLabel(current?.label);
-        // If no editor set yet, default editor becomes me
-        const editor = info.editor || me;
-        const mergedStamps = Array.from(new Set([...(info.stamps || []), me]));
-        const nextLabel = formatStandardLabel(editor, mergedStamps);
-        const ok = await updateVersionLabel(selectedVersionId, nextLabel);
-        if (!ok) {
-          // Fallback: create a new stamped version from current (atomic)
-          await createVersionFrom(selectedVersionId, nextLabel);
+        if (status !== "authenticated" || !user) return;
+        const me = identity();
+
+        // If nothing to save, just stamp the selected node in place.
+        if (!hasUnsavedChanges && selectedVersionId) {
+            const current = versions.find(v => v.id === selectedVersionId);
+            const info = parseStandardLabel(current?.label);
+            const editor = info.editor || me; // don't change editor if present
+            const mergedStamps = Array.from(new Set([...(info.stamps || []), me]));
+            const nextLabel = formatStandardLabel(editor, mergedStamps);
+            const ok = await updateVersionLabel(selectedVersionId, nextLabel);
+            if (!ok) {
+            // Fallback: create a stamped version from current
+            await createVersionFrom(selectedVersionId, nextLabel);
+            }
+            return;
         }
-        return;
-      }
-      // If there are unsaved changes, first create a version capturing them and stamp it.
-      await createVersionFrom(
-        editedFromVersionId || selectedVersionId || null,
-        formatStandardLabel(me, [me])
-      );
-    },
+
+        // Unsaved changes present:
+        // 1) Save a version with *you* as the editor (no stamps yet)
+        if (!item) return;
+        const snapshot: Partial<DatasetItem> = {
+            prompt: item.prompt || "",
+            inputs: item.inputs || "",
+            outputs: item.outputs || "",
+            code_file: item.code_file || "",
+            unit_tests: item.unit_tests || "",
+            solution: item.solution || "",
+            time_complexity: item.time_complexity || "",
+            space_complexity: item.space_complexity || "",
+            topics: item.topics || [],
+            difficulty: item.difficulty || "Easy",
+            notes: item.notes || ""
+        };
+        const baseId = editedFromVersionId || selectedVersionId || null;
+
+        // Save first, with editor=me, stamps=[]
+        const savePayload = await atomicSave(
+            snapshot,
+            baseId,
+            formatStandardLabel(me, [])
+        );
+
+        // 2) Now stamp the *new* head (or compressed head) by adding me to stamps
+        const newHeadId = (savePayload && savePayload.versionId) || item.currentVersionId || selectedVersionId;
+        if (newHeadId) {
+            const current = versions.find(v => v.id === newHeadId);
+            const info = parseStandardLabel(current?.label);
+            const editor = info.editor || me; // should already be me after save
+            const mergedStamps = Array.from(new Set([...(info.stamps || []), me]));
+            const nextLabel = formatStandardLabel(editor, mergedStamps);
+            await updateVersionLabel(newHeadId, nextLabel);
+        }
+        },
     handleSave,
     handleDelete,
     runTests,

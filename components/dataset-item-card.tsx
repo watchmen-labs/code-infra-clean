@@ -5,7 +5,7 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
 import { Input } from '@/components/ui/input'
-import { FileText } from 'lucide-react'
+import { FileText, GitBranch } from 'lucide-react' // optional: icon for path
 import Link from 'next/link'
 import { Plus, Copy } from 'lucide-react'
 import { DatasetItem } from './types'
@@ -17,6 +17,8 @@ interface DatasetItemCardProps {
   onAssignGroup: (itemId: string, group: string | null) => void
   activeGroup: string | null
   uniqueGroups: string[]
+  // NEW
+  stampPath?: string
 }
 
 export function DatasetItemCard({
@@ -25,7 +27,8 @@ export function DatasetItemCard({
   onSelectionChange,
   onAssignGroup,
   activeGroup,
-  uniqueGroups
+  uniqueGroups,
+  stampPath
 }: DatasetItemCardProps) {
   const getDifficultyColor = (difficulty: string) => {
     switch (difficulty) {
@@ -54,6 +57,8 @@ export function DatasetItemCard({
     }
     navigator.clipboard.writeText(JSON.stringify(obj, null, 2))
   }
+  const pathDisplay = (stampPath && stampPath.trim()) ? stampPath : 'none'
+
   return (
     <div className="flex items-center gap-3">
       <Checkbox
@@ -70,11 +75,20 @@ export function DatasetItemCard({
                 <h3 className="font-medium truncate" title={item.prompt}>
                   {item.prompt}
                 </h3>
+
                 {item.notes && item.notes.trim() && (
-                    <p className="text-sm text-muted-foreground mt-1 truncate text-blue-600" title={item.notes}>
-                      {item.notes}
-                    </p>
+                  <p className="text-sm text-muted-foreground mt-1 truncate text-blue-600" title={item.notes}>
+                    {item.notes}
+                  </p>
                 )}
+
+                {/* NEW: minimalist directed stamps path */}
+                <p className="text-xs text-muted-foreground mt-1 truncate" title={pathDisplay}>
+                  {/* optional icon */}
+                  {/* <GitBranch className="inline-block w-3 h-3 mr-1" /> */}
+                  {pathDisplay}
+                </p>
+
                 <div className="flex flex-wrap gap-1 mt-2">
                   {item.topics.map((topic) => (
                     <Badge key={topic} variant="secondary" className="text-xs">
@@ -97,12 +111,12 @@ export function DatasetItemCard({
                     <FileText className="w-3 h-3" />
                   </Badge>
                 )}
-                
               </div>
             </div>
           </CardContent>
         </Card>
       </Link>
+
       <div className="flex items-end">
         <Button
           variant="ghost"
@@ -115,6 +129,7 @@ export function DatasetItemCard({
           <Copy className="w-4 h-4" />
         </Button>
       </div>
+
       <div className="w-40">
         <Input
           placeholder="Assign group..."
@@ -123,7 +138,7 @@ export function DatasetItemCard({
           onBlur={(e) => onAssignGroup(item.id, e.target.value.trim() || null)}
           onKeyDown={(e) => {
             if (e.key === 'Enter') {
-                (e.target as HTMLInputElement).blur();
+              (e.target as HTMLInputElement).blur();
             }
           }}
           list="group-list"

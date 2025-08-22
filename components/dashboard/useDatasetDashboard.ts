@@ -80,7 +80,7 @@ export function useDatasetDashboard() {
   const [selectedIds, setSelectedIds] = useState(new Set<string>())
   const [sortConfig, setSortConfig] = useState<{ key: SortKey; direction: 'asc' | 'desc' }>({ key: 'createdAt', direction: 'desc' })
   const [activeGroup, setActiveGroup] = useState<string | null>(null)
-
+  const [stampPaths, setStampPaths] = useState<Record<string, string>>({})
   // Export modal
   const [isExportModalOpen, setIsExportModalOpen] = useState(false)
   const [exportOptions, setExportOptions] = useState<{ format: ExportFormat; keys: Set<keyof DatasetItem> }>({
@@ -98,7 +98,28 @@ export function useDatasetDashboard() {
 
   const ttl = 60_000
   const dsKey = `dataset:all:${user?.id || 'anon'}`
+    const fetchStampPathsBatch = async (ids: string[]) => {
+    try {
+      if (!ids.length) {
+        setStampPaths({})
+        return
+      }
+      const res = await fetch('/api/dataset/_stamp_paths', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
+        body: JSON.stringify({ ids })
+      })
+      if (!res.ok) return
+      const json = await res.json().catch(() => null)
+      const map = (json?.paths ?? {}) as Record<string, string>
+      console.log(map)
+      setStampPaths(map)
+    } catch {
+      // swallow any errors; UI simply won't show paths
+    }
+  }
 
+  
   const readCache = (k: string) => {
     if (typeof window === 'undefined') return null
     const raw = sessionStorage.getItem(k)
@@ -199,6 +220,9 @@ export function useDatasetDashboard() {
         setItems(merged)
         calculateAnalyticsLocal(merged)
         writeCache(dsKey, merged)
+
+        const ids = merged.map(i => i.id)
+        fetchStampPathsBatch(ids)
       }
     } catch {
       // swallow errors; show empty state
@@ -519,6 +543,8 @@ export function useDatasetDashboard() {
     const next = [...items, ...results]
     setItems(next); writeCache(dsKey, next); calculateAnalyticsLocal(next)
     setImportBusy(false)
+
+    fetchStampPathsBatch(next.map(i => i.id))
   }
 
   const uploadAndImportFile = async (fmt: 'csv' | 'jsonl', f: File) => {
@@ -551,6 +577,16 @@ export function useDatasetDashboard() {
     } finally {
       setImportBusy(false)
     }
+     // If successful, next is already built above; ensure paths are refreshed
+    try {
+      const parsed = await (async () => { /* no-op - next already computed */ })()
+    } catch {}
+    // NEW: safe refresh based on latest 'items' state after import
+    setTimeout(() => {
+      const current = (typeof window !== 'undefined') ? (JSON.parse(sessionStorage.getItem(dsKey) || '{"data": []}').data || []) : []
+      const list = Array.isArray(current) && current.length ? current : items
+      fetchStampPathsBatch(list.map((i: DatasetItem) => i.id))
+    }, 0)
   }
 
   const triggerImport = (fmt: 'csv' | 'jsonl') => {
@@ -565,7 +601,7 @@ export function useDatasetDashboard() {
     await uploadAndImportFile(importFormat, f)
     setFileInputKey(v => v + 1)
   }
-
+  
   return {
     // data
     items, setItems,
@@ -580,6 +616,7 @@ export function useDatasetDashboard() {
     // derived
     sortedItems,
 
+    stampPaths,
     // actions
     handleSort,
     handleSelection,

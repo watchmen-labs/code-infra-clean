@@ -720,7 +720,17 @@ def atomic_save(item_id):
             return jsonify({"error": "Missing 'data'"}), 400
 
         now = datetime.now().isoformat()
+          # Enforce: only compress the current head
+        try:
+            ds_res = supabase.table('dataset').select('currentVersionId').eq('id', item_id).single().execute()
+            ds = getattr(ds_res, "data", None) or {}
+            current_head = ds.get("currentVersionId")
+        except Exception:
+            current_head = None
 
+        if compress_into and compress_into != current_head:
+            # Treat as a new version instead of mutating history
+            compress_into = None
         if compress_into:
             # Update existing version in place
             patch = {"data": snapshot}
@@ -771,7 +781,128 @@ def atomic_save(item_id):
     except Exception as e:
         logger.exception(f"Atomic save failed item_id={item_id} rid={getattr(g,'_rid','-')}")
         return jsonify({'error': f'Atomic save failed: {str(e)}'}), 500
+def _email_local_part(s: str | None) -> str:
+    """Return the part before '@' if this looks like an email; otherwise return the string as-is."""
+    val = str(s or "").strip()
+    if not val:
+        return ""
+    if "@" in val:
+        return val.split("@", 1)[0]
+    return val
 
+def _parse_label_to_editor_and_stamps(label: str | None) -> tuple[str, list[str]]:
+    """
+    Expected format from formatStandardLabel(editor, stamps):
+      'editor:'  OR  'editor: a, b, c'  OR  ''
+
+    Returns (editor_local_part, [unique_stamp_local_parts]).
+    """
+    s = (label or "").strip()
+    if not s:
+        return "", []
+    # Split on first colon
+    editor, sep, right = s.partition(":")
+    editor_name = _email_local_part(editor)
+    stamps: list[str] = []
+    if sep:  # there was a colon
+        parts = [p.strip() for p in right.split(",")]
+        seen = set()
+        for p in parts:
+            if not p:
+                continue
+            name = _email_local_part(p)
+            if name and name not in seen:
+                seen.add(name)
+                stamps.append(name)
+    return editor_name, stamps
+
+def _compute_stamp_path_for_item(versions: dict, head_id: str | None) -> tuple[str, list[list[str]]]:
+    """
+    Traverse parent chain from head -> root, collect stamps per version node.
+    Skip nodes with no stamps. Returns (path_str, segments), where segments is
+    a list of lists of stampers per node in traversal order (head-first).
+    """
+    if not head_id:
+        return "none", []
+
+    path_segments: list[list[str]] = []
+    seen: set[str] = set()
+    curr = head_id
+    steps = 0
+
+    while curr and curr in versions and curr not in seen and steps < 1000:
+        seen.add(curr)
+        node = versions[curr]
+        _, stamps = _parse_label_to_editor_and_stamps(node.get("label"))
+        if stamps:
+            path_segments.append(stamps)
+        curr = node.get("parent_id")
+        steps += 1
+
+    if not path_segments:
+        return "none", []
+    segment_strings = [", ".join(seg) for seg in path_segments]
+    return " -> ".join(segment_strings), path_segments
+
+# ------------------------------------------------------------------------------
+# Stamp paths (batch) (protected)
+# ------------------------------------------------------------------------------
+@app.route('/api/dataset/_stamp_paths', methods=['POST'])
+@db_guard
+def batch_stamp_paths():
+    """
+    Request:  { "ids": ["<dataset_id>", ...] }
+    Response: { "paths": { "<dataset_id>": "a -> a, b" | "none", ... },
+                "segments": { "<dataset_id>": [["a"], ["a","b"]], ... } }
+    """
+    try:
+        body = request.get_json(silent=True) or {}
+        ids = body.get("ids") or []
+        if not isinstance(ids, list) or not ids:
+            return jsonify({"paths": {}, "segments": {}})
+
+        ids = [str(x) for x in ids if x]
+
+        # Helper to chunk .in_() calls so we don't risk long URLs with many ids
+        def _chunks(lst, n=200):
+            for i in range(0, len(lst), n):
+                yield lst[i:i + n]
+
+        # 1) Fetch heads for requested dataset items
+        head_map: dict[str, str | None] = {}
+        for chunk in _chunks(ids):
+            ds_res = supabase.table('dataset').select('id,currentVersionId').in_('id', chunk).execute()
+            rows = getattr(ds_res, "data", []) or []
+            for r in rows:
+                head_map[r["id"]] = r.get("currentVersionId")
+
+        # 2) Fetch all versions for these items (only fields necessary)
+        versions_by_item: dict[str, dict[str, dict]] = {}
+        for chunk in _chunks(ids):
+            v_res = supabase.table('task_versions').select('id,item_id,parent_id,label').in_('item_id', chunk).execute()
+            vrows = getattr(v_res, "data", []) or []
+            for v in vrows:
+                d = versions_by_item.setdefault(v["item_id"], {})
+                d[v["id"]] = {
+                    "id": v["id"],
+                    "parent_id": v.get("parent_id"),
+                    "label": v.get("label", "")
+                }
+
+        # 3) Build paths
+        paths: dict[str, str] = {}
+        segments: dict[str, list[list[str]]] = {}
+        for item_id in ids:
+            head_id = head_map.get(item_id)
+            versions = versions_by_item.get(item_id, {})
+            path_str, segs = _compute_stamp_path_for_item(versions, head_id)
+            paths[item_id] = path_str
+            segments[item_id] = segs
+
+        return jsonify({"paths": paths, "segments": segments})
+    except Exception as e:
+        logger.exception(f"Failed to compute stamp paths rid={getattr(g,'_rid','-')}")
+        return jsonify({"error": "Failed to compute stamp paths"}), 500
 # ------------------------------------------------------------------------------
 # Test runner proxy (protected)
 # ------------------------------------------------------------------------------

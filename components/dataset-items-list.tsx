@@ -9,7 +9,8 @@ import { DatasetItemCard } from './dataset-item-card'
 import { DatasetItem, SortKey } from './types'
 
 interface DatasetItemsListProps {
-  items: DatasetItem[]
+  items: DatasetItem[]  // <-- keep existing type; next line adds new prop
+  stampPaths: Record<string, string>   // NEW
   sortedItems: DatasetItem[]
   selectedIds: Set<string>
   sortConfig: { key: SortKey; direction: 'asc' | 'desc' }
@@ -23,6 +24,7 @@ interface DatasetItemsListProps {
 
 export function DatasetItemsList({
   items,
+  stampPaths,         // NEW
   sortedItems,
   selectedIds,
   sortConfig,
@@ -33,8 +35,6 @@ export function DatasetItemsList({
   onSort,
   onAssignGroup
 }: DatasetItemsListProps) {
-  
-
   return (
     <Card>
       <CardHeader>
@@ -73,7 +73,6 @@ export function DatasetItemsList({
             {sortedItems.map((item) => (
               <div key={item.id} className="grid grid-cols-[1fr_auto] gap-2 w-full">
                 <div className="min-w-0">
-                
                   <DatasetItemCard
                     item={item}
                     isSelected={selectedIds.has(item.id)}
@@ -81,9 +80,10 @@ export function DatasetItemsList({
                     onAssignGroup={onAssignGroup}
                     activeGroup={activeGroup}
                     uniqueGroups={uniqueGroups}
+                    // NEW: pass path for this item
+                    stampPath={stampPaths[item.id]}
                   />
                 </div>
-                
               </div>
             ))}
           </div>
