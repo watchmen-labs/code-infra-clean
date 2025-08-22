@@ -1,25 +1,51 @@
 # index.py
-from flask import Flask, request, jsonify, g
-from flask_cors import CORS
+from __future__ import annotations
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Standard / 3rd-party imports
+# ────────────────────────────────────────────────────────────────────────────────
+import io
+import json
+import csv
+import hmac
+import logging
 import os
 import sys
-import json
-import requests
-from datetime import datetime
-from dotenv import load_dotenv
-from functools import wraps
-from supabase import create_client, Client
-import urllib.parse
-import logging
 import time
 import uuid
-import io
-import csv
+from datetime import datetime
+from functools import wraps
+from typing import Any, Callable, Tuple, List
+import requests
+from dotenv import load_dotenv
+from flask import Flask, request, jsonify, g
+from flask_cors import CORS
+import urllib
+from supabase import create_client, Client
 from werkzeug.exceptions import HTTPException
 
-# ------------------------------------------------------------------------------
-# Logging
-# ------------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────────────────
+# Early setup & env
+# ────────────────────────────────────────────────────────────────────────────────
+load_dotenv()  # .env first so everything below can read env vars
+
+SUPABASE_URL: str | None = os.getenv("SUPABASE_URL")
+SRK: str | None = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+
+if not SUPABASE_URL or not SRK:
+    raise RuntimeError(
+        "❌  SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set as env variables."
+    )
+
+# Shared secret for server-to-server auth.  Defaults to the SRK if not overridden.
+BACKEND_SHARED_SECRET: str = os.getenv("BACKEND_SHARED_SECRET", SRK)
+REQUIRE_BACKEND_SECRET: bool = (
+    os.getenv("REQUIRE_BACKEND_SECRET", "true").strip().lower() == "true"
+)
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Logging config
+# ────────────────────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
@@ -27,53 +53,81 @@ logging.basicConfig(
 )
 logger = logging.getLogger("api")
 
-# ------------------------------------------------------------------------------
-# App / CORS / Env
-# ------------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────────────────
+# Flask app + CORS
+# ────────────────────────────────────────────────────────────────────────────────
 app = Flask(__name__)
-CORS(app)
-load_dotenv()
 
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SRK = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-SUPABASE_KEY = SRK or os.getenv("SUPABASE_ANON_KEY")
-if not SUPABASE_URL or not SUPABASE_KEY:
-    logger.error("Missing SUPABASE_URL or key; Supabase client will fail.")
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-if not SRK:
-    logger.warning(
-        "Running WITHOUT SUPABASE_SERVICE_ROLE_KEY. "
-        "If RLS is enabled on 'dataset', updates may be blocked (symptoms: currentVersionId stays null; dataset row never changes)."
-    )
+# Allow your FE origins and the custom header used for the secret.
+CORS(
+    app,
+    resources={r"/api/*": {"origins": os.getenv("CORS_ORIGINS", "*").split(",")}},
+    supports_credentials=True,
+    allow_headers=[
+        "Content-Type",
+        "Authorization",
+        "X-Request-ID",
+        "X-Service-Auth",
+    ],
+)
 
-# ------------------------------------------------------------------------------
-# Allowlist security (protect ALL DB routes)
-# ------------------------------------------------------------------------------
-# You can hardcode emails here OR set ALLOWED_EMAILS env (comma-separated).
-# If both are provided, ENV overrides this static set.
-STATIC_ALLOWED_EMAILS = set([
+# ────────────────────────────────────────────────────────────────────────────────
+# Supabase client (always with SRK; per-request we’ll bind the user JWT)
+# ────────────────────────────────────────────────────────────────────────────────
+supabase: Client = create_client(SUPABASE_URL, SRK)
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Allowlist security (second layer after shared secret)
+# ────────────────────────────────────────────────────────────────────────────────
+STATIC_ALLOWED_EMAILS: set[str] = {
     # "you@example.com",
     # "teammate@example.com",
-])
+}
+
 _env_allowed = os.getenv("ALLOWED_EMAILS", "").strip()
 if _env_allowed:
     ALLOWED_EMAILS = {e.strip().lower() for e in _env_allowed.split(",") if e.strip()}
 else:
     ALLOWED_EMAILS = {e.strip().lower() for e in STATIC_ALLOWED_EMAILS if e.strip()}
 
+
 def _is_allowed(email: str | None) -> bool:
-    # If the allowlist is empty, allow all authenticated users (non-breaking default).
+    """True if allowlist is empty or email is in the list (case-insensitive)."""
     if not ALLOWED_EMAILS:
         return True
     return (email or "").lower() in ALLOWED_EMAILS
 
-# ------------------------------------------------------------------------------
-# Request logging & error handling
-# ------------------------------------------------------------------------------
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Request instrumentation
+# ────────────────────────────────────────────────────────────────────────────────
+PUBLIC_PATHS = {"/api/auth/start", "/api/auth/user"}
+
+
 @app.before_request
-def _log_request_start():
+def _log_request_start() -> None:
     g._start_time = time.time()
     g._rid = request.headers.get("X-Request-ID") or uuid.uuid4().hex
+
+
+@app.before_request
+def _enforce_backend_secret_header():
+    """Require X-Service-Auth on every non-public route (if enabled)."""
+    if not REQUIRE_BACKEND_SECRET:
+        return
+
+    if request.path in PUBLIC_PATHS:
+        return
+
+    presented = request.headers.get("X-Service-Auth", "")
+    if not presented or not hmac.compare_digest(presented, BACKEND_SHARED_SECRET):
+        logger.warning(
+            "Forbidden (missing/invalid X-Service-Auth) path=%s rid=%s",
+            request.path,
+            getattr(g, "_rid", "-"),
+        )
+        return jsonify({"error": "Forbidden"}), 403
+
 
 @app.after_request
 def _log_request_end(response):
@@ -81,45 +135,60 @@ def _log_request_end(response):
         duration_ms = (time.time() - getattr(g, "_start_time", time.time())) * 1000
         uid = getattr(g, "user_id", None)
         logger.info(
-            f"{request.method} {request.path} {response.status_code} {duration_ms:.2f}ms "
-            f"rid={getattr(g,'_rid','-')}" + (f" uid={uid}" if uid else "")
+            "%s %s %s %.2fms rid=%s%s",
+            request.method,
+            request.path,
+            response.status_code,
+            duration_ms,
+            getattr(g, "_rid", "-"),
+            f" uid={uid}" if uid else "",
         )
     except Exception:
         pass
     return response
 
+
 @app.errorhandler(HTTPException)
-def _handle_http_exception(e):
-    logger.warning(f"HTTPException {e.code} {e.name} path={request.path} rid={getattr(g,'_rid','-')}")
+def _handle_http_exception(e: HTTPException):
+    logger.warning(
+        "HTTPException %s %s path=%s rid=%s",
+        e.code,
+        e.name,
+        request.path,
+        getattr(g, "_rid", "-"),
+    )
     return e
 
+
 @app.errorhandler(Exception)
-def _handle_unhandled_exception(e):
-    logger.exception(f"Unhandled exception path={request.path} rid={getattr(g,'_rid','-')}")
+def _handle_unhandled_exception(e: Exception):
+    logger.exception("Unhandled exception path=%s rid=%s", request.path, getattr(g, "_rid", "-"))
     return jsonify({"error": "Internal Server Error"}), 500
 
-# ------------------------------------------------------------------------------
+
+# ────────────────────────────────────────────────────────────────────────────────
 # Auth helpers
-# ------------------------------------------------------------------------------
-def get_current_user():
+# ────────────────────────────────────────────────────────────────────────────────
+def get_current_user() -> Tuple[str | None, str | None, str | None]:
+    """Return (uid, email, jwt) or (None, None, None)."""
     auth = request.headers.get("Authorization", "")
-    token = None
-    if auth.startswith("Bearer "):
-        token = auth.split(" ", 1)[1].strip()
+    token = auth.split(" ", 1)[1].strip() if auth.startswith("Bearer ") else None
     if not token:
         return None, None, None
-    # Try Python client
+
+    # Preferred method via python client (fast path).
     try:
         u = supabase.auth.get_user(token)
         if getattr(u, "user", None) and getattr(u.user, "id", None):
             return u.user.id, getattr(u.user, "email", None), token
     except Exception:
         pass
-    # Fallback raw HTTP
+
+    # Fallback raw HTTP call.
     try:
         r = requests.get(
             f"{SUPABASE_URL}/auth/v1/user",
-            headers={"Authorization": f"Bearer {token}", "apikey": SUPABASE_KEY},
+            headers={"Authorization": f"Bearer {token}", "apikey": SRK},
             timeout=15,
         )
         if r.status_code == 200:
@@ -127,52 +196,79 @@ def get_current_user():
             return j.get("id"), j.get("email"), token
     except Exception:
         pass
+
     return None, None, None
+
 
 def _auth_and_set_g():
     uid, email, token = get_current_user()
     if not uid:
         return None, None, None
+
     g.user_id = uid
     g.user_email = email
     g._jwt = token
+
+    # Bind JWT to PostgREST so RLS policies run as this user.
     try:
-        # Tell PostgREST to run as this user (RLS will see their uid)
         supabase.postgrest.auth(token)
     except Exception:
         logger.warning("Failed to bind JWT to PostgREST")
+
     return uid, email, token
 
-def db_guard(fn):
+
+def db_guard(fn: Callable) -> Callable:
+    """Decorator that enforces auth + allowlist on database routes."""
+
     @wraps(fn)
     def wrapper(*args, **kwargs):
         uid, email, token = _auth_and_set_g()
         if not uid:
-            logger.warning(f"Unauthorized access to {request.path} rid={getattr(g,'_rid','-')}")
+            logger.warning("Unauthorized access to %s rid=%s", request.path, getattr(g, "_rid", "-"))
             return jsonify({"error": "Unauthorized"}), 401
+
         if not _is_allowed(email):
-            logger.warning(f"Forbidden (allowlist) path={request.path} email={email} rid={getattr(g,'_rid','-')}")
+            logger.warning(
+                "Forbidden (allowlist) path=%s email=%s rid=%s",
+                request.path,
+                email,
+                getattr(g, "_rid", "-"),
+            )
             return jsonify({"error": "Forbidden"}), 403
+
         try:
             return fn(*args, **kwargs)
         finally:
-            # Avoid cross-request header leakage on the global client
+            # Avoid cross-request header leakage.
             try:
                 supabase.postgrest.auth(None)
             except Exception:
                 pass
+
     return wrapper
 
-# ------------------------------------------------------------------------------
-# Normalize & transform helpers
-# ------------------------------------------------------------------------------
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Helpers for dataset logic (unchanged)
+# ────────────────────────────────────────────────────────────────────────────────
 TASK_KEYS = [
-    "prompt", "inputs", "outputs", "unit_tests", "solution",
-    "code_file", "language", "group", "difficulty", "topics",
-    "time_complexity", "space_complexity",
+    "prompt",
+    "inputs",
+    "outputs",
+    "unit_tests",
+    "solution",
+    "code_file",
+    "language",
+    "group",
+    "difficulty",
+    "topics",
+    "time_complexity",
+    "space_complexity",
 ]
 
-def _normalize_topics(v):
+
+def _normalize_topics(v: Any) -> List[str]:
     if isinstance(v, list):
         return [str(x) for x in v if str(x).strip() != ""]
     if isinstance(v, str):
@@ -180,7 +276,8 @@ def _normalize_topics(v):
         return [p for p in parts if p]
     return []
 
-def _normalize_difficulty(v):
+
+def _normalize_difficulty(v: Any) -> str:
     s = str(v or "").strip().lower()
     if s == "hard":
         return "Hard"
@@ -188,7 +285,8 @@ def _normalize_difficulty(v):
         return "Medium"
     return "Easy"
 
-def _flatten_dataset_row(row):
+
+def _flatten_dataset_row(row: dict) -> dict:
     meta = row.get("meta") or {}
     for k in TASK_KEYS:
         if not meta.get(k):
