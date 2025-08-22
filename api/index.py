@@ -931,16 +931,18 @@ def _compute_stamp_path_for_item(versions: dict, head_id: str | None) -> tuple[s
     while curr and curr in versions and curr not in seen and steps < 1000:
         seen.add(curr)
         node = versions[curr]
-        _, stamps = _parse_label_to_editor_and_stamps(node.get("label"))
+        e_name, stamps = _parse_label_to_editor_and_stamps(node.get("label"))
+
+        path_segments.append([e_name])
         if stamps:
-            path_segments.append(stamps)
+            path_segments[-1] += [f"[{i}]" for i in stamps if i != e_name]
         curr = node.get("parent_id")
         steps += 1
 
     if not path_segments:
         return "none", []
-    segment_strings = [", ".join(seg) for seg in path_segments]
-    return " <- ".join(segment_strings), path_segments
+    segment_strings = list(reversed([", ".join(seg) for seg in path_segments]))
+    return " -> ".join(segment_strings), path_segments
 
 # ------------------------------------------------------------------------------
 # Stamp paths (batch) (protected)
