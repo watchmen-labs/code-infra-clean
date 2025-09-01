@@ -1,3 +1,4 @@
+"use client";
 /**
  * Public browser API for the isomorphic autograder (client-only).
  * Spawns a dedicated worker per run; no Next API routes are used.
@@ -14,14 +15,10 @@ export async function runAutograder(req: RunRequest): Promise<RunResult> {
   const timeoutMs = req.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 
   // Use module workers that bundle with Next/Webpack: new URL(..., import.meta.url)
-  const workerUrl =
-    lang === 'js'
-      ? new URL('./workers/js-runner.ts', import.meta.url)
-      : lang === 'python'
-      ? new URL('./workers/python-runner.ts', import.meta.url)
-      : new URL('./workers/ocaml-runner.ts', import.meta.url);
-
-  const worker = new Worker(workerUrl, { type: 'module' });
+  const worker =
+  lang === 'js'
+    ? new Worker(new URL('./workers/js-runner.ts', import.meta.url), { type: 'module' })
+    : new Worker(new URL('./workers/python-runner.ts', import.meta.url), { type: 'module' });
 
   return await new Promise<RunResult>((resolve) => {
     const timer = setTimeout(() => {

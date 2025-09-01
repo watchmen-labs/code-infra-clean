@@ -6,6 +6,7 @@ import { useAuth } from "@/components/auth-context";
 import { DatasetItem, TestResult, VersionNode } from "@/components/types";
 import { readCache, writeCache, updateArrayItemInCacheById, formatStandardLabel, mergeStampIntoLabel, parseStandardLabel } from "@/components/utils";
 import { clearCommentsAndDocstrings } from "@/components/utils";
+import { runAutograder } from "./testharness";
 
 const TTL_MS = 60_000;
 const DS_KEY = "dataset:all";
@@ -340,22 +341,30 @@ export function useReviewItem(id: string, router: any) {
     if (!item) return;
     setRunning(true);
     setTestResult(null);
-    try {
-      const response = await fetch("/api/run-tests", {
-        method: "POST",
-        headers: { ...(getAuthHeaders() || {}), "Content-Type": "application/json" },
-        body: JSON.stringify({ solution: item.solution, tests: item.unit_tests })
-      });
-      const result = await response.json();
-      setTestResult(result);
-      const updatedItem = { ...item, lastRunSuccessful: result.success };
-      setItem(updatedItem);
-      setHasUnsavedChanges(true);
-    } catch {
-      setTestResult({ success: false, output: "", error: "Failed to run tests" });
-    } finally {
-      setRunning(false);
-    }
+    const result = await runAutograder({ solution: item.solution, tests: item.unit_tests });
+    setTestResult(result as TestResult);
+    const updatedItem = { ...item, lastRunSuccessful: result.success };
+    setItem(updatedItem as DatasetItem);
+    setHasUnsavedChanges(true);
+    setRunning(false);
+    return result;
+
+    // try {
+    //   const response = await fetch("/api/run-tests", {
+    //     method: "POST",
+    //     headers: { ...(getAuthHeaders() || {}), "Content-Type": "application/json" },
+    //     body: JSON.stringify({ solution: item.solution, tests: item.unit_tests })
+    //   });
+    //   const result = await response.json();
+    //   setTestResult(result);
+    //   const updatedItem = { ...item, lastRunSuccessful: result.success };
+    //   setItem(updatedItem);
+    //   setHasUnsavedChanges(true);
+    // } catch {
+    //   setTestResult({ success: false, output: "", error: "Failed to run tests" });
+    // } finally {
+    //   setRunning(false);
+    // }
   };
 
   const navigateToItem = (direction: "prev" | "next") => {
