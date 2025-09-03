@@ -37,14 +37,18 @@ const normalizeForCreate = (p: Partial<DatasetItem>): Partial<DatasetItem> => {
     outputs: String(p.outputs ?? ''),
     unit_tests: String(p.unit_tests ?? ''),
     solution: String(p.solution ?? ''),
+    sota_solution: String((p as any).sota_solution ?? ''),
     code_file: p.code_file ? String(p.code_file) : '',
     language: p.language ? String(p.language) : undefined,
     group: p.group === '' ? null : p.group ?? null,
     time_complexity: String(p.time_complexity ?? ''),
     space_complexity: String(p.space_complexity ?? ''),
+    sota_time_complexity: String((p as any).sota_time_complexity ?? ''),
+    sota_space_complexity: String((p as any).sota_space_complexity ?? ''),
     topics: toTopics(p.topics),
     difficulty: normDifficulty((p as any).difficulty),
-    notes: String(p.notes ?? '')
+    notes: String(p.notes ?? ''),
+    sota_correct: Boolean((p as any).sota_correct ?? false)
   }
 }
 
@@ -425,14 +429,19 @@ export function useDatasetDashboard() {
       outputs: o?.outputs || '',
       code_file: o?.code_file || '',
       solution: o?.reference_solution ?? o?.solution ?? '',
+      // SOTA solution lives in metadata; fall back to top-level for backwards compatibility
+      sota_solution: meta?.sota_solution || o?.sota_solution || '',
       unit_tests: o?.unit_tests || '',
       language: o?.language,
       difficulty: meta?.difficulty || o?.difficulty || 'Easy',
       topics: meta?.topics || o?.topics,
       time_complexity: meta?.time_complexity || o?.time_complexity || '',
       space_complexity: meta?.space_complexity || o?.space_complexity || '',
+      sota_time_complexity: meta?.sota_time_complexity || o?.sota_time_complexity || '',
+      sota_space_complexity: meta?.sota_space_complexity || o?.sota_space_complexity || '',
       notes: o?.notes || '',
-      group: o?.group ?? null
+      group: o?.group ?? null,
+      sota_correct: meta?.sota_correct ?? o?.sota_correct ?? false
     })
   }
 
@@ -450,14 +459,18 @@ export function useDatasetDashboard() {
       outputs: clean(row['outputs']),
       code_file: clean(row['code_file']),
       solution: clean(row['reference_solution'] || row['solution']),
+      sota_solution: clean(row['sota_solution']),
       unit_tests: clean(row['unit_tests']),
       language: clean(row['language']) || undefined,
       difficulty: normDifficulty(clean(row['difficulty'])),
       topics: toTopics(clean(row['topics'])),
       time_complexity: clean(row['time_complexity']),
       space_complexity: clean(row['space_complexity']),
+      sota_time_complexity: clean(row['sota_time_complexity']),
+      sota_space_complexity: clean(row['sota_space_complexity']),
       notes: clean(row['notes']),
-      group: row['group'] ? clean(row['group']) : null
+      group: row['group'] ? clean(row['group']) : null,
+      sota_correct: clean(row['sota_correct']) === 'true'
     })
   }
 

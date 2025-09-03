@@ -66,12 +66,16 @@ export function GroupsSection({ items, activeGroup, onGroupChange }: GroupsSecti
       outputs: item.outputs,
       code_file: item.code_file,
       reference_solution: item.solution,
+      sota_solution: item.sota_solution,
       unit_tests: item.unit_tests,
       metadata: {
         difficulty: item.difficulty,
         topics: item.topics,
         time_complexity: item.time_complexity,
         space_complexity: item.space_complexity,
+        sota_time_complexity: item.sota_time_complexity,
+        sota_space_complexity: item.sota_space_complexity,
+        sota_correct: item.sota_correct,
       }
     }))
     const jsonl = transformed.map(obj => JSON.stringify(obj)).join('\n')
