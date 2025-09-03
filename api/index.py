@@ -263,8 +263,6 @@ TASK_KEYS = [
     "group",
     "difficulty",
     "topics",
-    "time_complexity",
-    "space_complexity",
 ]
 
 
@@ -293,6 +291,10 @@ def _flatten_dataset_row(row: dict) -> dict:
             v = row.get(k)
             if v is not None:
                 meta[k] = v
+    # Backfill historical columns for complexity fields if present top-level
+    for k in ["time_complexity", "space_complexity", "sota_time_complexity", "sota_space_complexity"]:
+        if k not in meta and row.get(k) is not None:
+            meta[k] = row.get(k)
     out = {"id": row.get("id")}
     out.update(meta)
     out["notes"] = row.get("notes", "") or ""
@@ -333,8 +335,6 @@ def _row_from_generic_payload(payload, now):
         "group": meta["group"],
         "difficulty": meta["difficulty"],
         "topics": meta["topics"],
-        "time_complexity": meta["time_complexity"],
-        "space_complexity": meta["space_complexity"],
         "notes": payload.get("notes", "") or "",
         "lastRunSuccessful": bool(payload.get("lastRunSuccessful", False)),
         "createdAt": now,
@@ -366,12 +366,14 @@ def _normalize_snapshot_fields(snapshot: dict) -> dict:
             s[k] = ""
     if "sota_correct" in s:
         s["sota_correct"] = bool(s.get("sota_correct"))
+    if "lastRunSuccessful" in s:
+        s["lastRunSuccessful"] = bool(s.get("lastRunSuccessful"))
     return s
 
 def _merge_meta_with_snapshot(existing_meta: dict, snapshot: dict) -> dict:
     merged = dict(existing_meta or {})
     for k, v in (snapshot or {}).items():
-        if k not in ("notes",):
+        if k not in ("notes", "lastRunSuccessful"):
             merged[k] = v
     return merged
 
@@ -427,6 +429,7 @@ def _sync_dataset_with_snapshot(item_id: str, snapshot: dict, *, set_current_ver
         "meta": merged_meta,
         "notes": norm.get("notes", existing.get("notes", "") or ""),
         "updatedAt": now,
+        "lastRunSuccessful": norm.get("lastRunSuccessful", existing.get("lastRunSuccessful", False)),
     }
     if set_current_version_id is not None:
         updates["currentVersionId"] = set_current_version_id

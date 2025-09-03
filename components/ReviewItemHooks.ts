@@ -259,6 +259,7 @@ export function useReviewItem(id: string, router: any) {
       sota_time_complexity: item.sota_time_complexity || "",
       sota_space_complexity: item.sota_space_complexity || "",
       sota_correct: item.sota_correct || false,
+      lastRunSuccessful: item.lastRunSuccessful || false,
       topics: item.topics || [],
       difficulty: item.difficulty || "Easy",
       notes: item.notes || ""
@@ -521,6 +522,7 @@ export function useReviewItem(id: string, router: any) {
             sota_time_complexity: item.sota_time_complexity || "",
             sota_space_complexity: item.sota_space_complexity || "",
             sota_correct: item.sota_correct || false,
+            lastRunSuccessful: item.lastRunSuccessful || false,
             topics: item.topics || [],
             difficulty: item.difficulty || "Easy",
             notes: item.notes || ""
