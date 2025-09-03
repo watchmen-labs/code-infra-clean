@@ -195,8 +195,8 @@ export const executeExport = (
 
   if (format === 'csv') {
     const csvHeaders = [
-      'id', 'language', 'prompt', 'inputs', 'outputs', 'code_file', 'reference_solution', 'unit_tests',
-      'difficulty', 'topics', 'time_complexity', 'space_complexity', 'notes',
+      'id', 'language', 'prompt', 'inputs', 'outputs', 'code_file', 'reference_solution', 'sota_solution', 'unit_tests',
+      'difficulty', 'topics', 'time_complexity', 'space_complexity', 'sota_time_complexity', 'sota_space_complexity', 'sota_correct', 'notes',
       'createdAt', 'updatedAt', 'lastRunSuccessful', 'group', 'full_task_json'
     ];
     const header = csvHeaders.join(',') + '\n';
@@ -209,12 +209,16 @@ export const executeExport = (
         outputs: item.outputs,
         code_file: item.code_file,
         reference_solution: item.solution,
+        sota_solution: item.sota_solution,
         unit_tests: item.unit_tests,
         metadata: {
           difficulty: item.difficulty,
           topics: item.topics,
           time_complexity: item.time_complexity,
           space_complexity: item.space_complexity,
+          sota_time_complexity: item.sota_time_complexity,
+          sota_space_complexity: item.sota_space_complexity,
+          sota_correct: item.sota_correct,
         }
       });
 
@@ -226,11 +230,15 @@ export const executeExport = (
         item.outputs,
         item.code_file,
         item.solution,
+        item.sota_solution,
         item.unit_tests,
         item.difficulty,
         item.topics,
         item.time_complexity,
         item.space_complexity,
+        item.sota_time_complexity,
+        item.sota_space_complexity,
+        item.sota_correct,
         item.notes,
         item.createdAt,
         item.updatedAt,
@@ -256,12 +264,16 @@ export const executeExport = (
       outputs: item.outputs,
       code_file: item.code_file,
       reference_solution: item.solution,
+      sota_solution: item.sota_solution,
       unit_tests: item.unit_tests,
       metadata: {
         difficulty: item.difficulty,
         topics: item.topics,
         time_complexity: item.time_complexity,
         space_complexity: item.space_complexity,
+        sota_time_complexity: item.sota_time_complexity,
+        sota_space_complexity: item.sota_space_complexity,
+        sota_correct: item.sota_correct,
       }
     }));
     dataStr = transformedData.map(item => JSON.stringify(item)).join('\n');
@@ -275,12 +287,16 @@ export const executeExport = (
       outputs: item.outputs,
       code_file: item.code_file,
       reference_solution: item.solution,
+      sota_solution: item.sota_solution,
       unit_tests: item.unit_tests,
       metadata: {
         difficulty: item.difficulty,
         topics: item.topics,
         time_complexity: item.time_complexity,
         space_complexity: item.space_complexity,
+        sota_time_complexity: item.sota_time_complexity,
+        sota_space_complexity: item.sota_space_complexity,
+        sota_correct: item.sota_correct,
       }
     }));
     dataStr = JSON.stringify(transformedData, null, 2);

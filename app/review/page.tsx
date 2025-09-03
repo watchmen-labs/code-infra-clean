@@ -18,8 +18,9 @@ import { clearCommentsAndDocstrings, formatStandardLabel } from '@/components/ut
 import { useAutoResize } from '@/components/useAutoResize'
 import { DatasetItem } from '@/components/types'
 import { useAuth } from '@/components/auth-context'
+import { Checkbox } from '@/components/ui/checkbox'
 
-type NewDatasetItem = Omit<DatasetItem, 'id' | 'createdAt' | 'updatedAt' | 'lastRunSuccessful'> & { lastRunSuccessful?: boolean }
+type NewDatasetItem = Omit<DatasetItem, 'id' | 'createdAt' | 'updatedAt' | 'lastRunSuccessful' | 'sota_correct'> & { lastRunSuccessful?: boolean; sota_correct?: boolean }
 
 interface TestResult {
   success: boolean
@@ -33,15 +34,20 @@ export default function NewReview() {
   const { headers: authHeaders, user } = useAuth()
   const [saving, setSaving] = useState(false)
   const [running, setRunning] = useState(false)
-  const [testResult, setTestResult] = useState<TestResult | null>(null)
+  const [testResultRef, setTestResultRef] = useState<TestResult | null>(null)
+  const [testResultSota, setTestResultSota] = useState<TestResult | null>(null)
   const [newTopic, setNewTopic] = useState('')
   const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false)
   const [item, setItem] = useState<NewDatasetItem>({
     prompt: '',
     unit_tests: '',
     solution: '',
+    sota_solution: '',
     time_complexity: '',
     space_complexity: '',
+    sota_time_complexity: '',
+    sota_space_complexity: '',
+    sota_correct: false,
     topics: [],
     difficulty: 'Easy',
     notes: '',
@@ -91,19 +97,30 @@ export default function NewReview() {
 
   const runTests = async () => {
     setRunning(true)
-    setTestResult(null)
+    setTestResultRef(null)
+    setTestResultSota(null)
     try {
-      const response = await fetch('/api/run-tests', {
+      if (item.sota_solution.trim()) {
+        const resSota = await fetch('/api/run-tests', {
+          method: 'POST',
+          headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+          body: JSON.stringify({ solution: item.sota_solution, tests: item.unit_tests }),
+        })
+        const resultSota = await resSota.json()
+        setTestResultSota(resultSota)
+        setItem(prev => ({ ...prev, sota_correct: resultSota.success }))
+      }
+      const resRef = await fetch('/api/run-tests', {
         method: 'POST',
         headers: { ...authHeaders(), 'Content-Type': 'application/json' },
         body: JSON.stringify({ solution: item.solution, tests: item.unit_tests }),
       })
-      const result = await response.json()
-      setTestResult(result)
-      setItem(prev => ({ ...prev, lastRunSuccessful: result.success }))
+      const resultRef = await resRef.json()
+      setTestResultRef(resultRef)
+      setItem(prev => ({ ...prev, lastRunSuccessful: resultRef.success }))
       setHasUnsavedChanges(true)
     } catch {
-      setTestResult({ success: false, output: '', error: 'Failed to run tests' })
+      setTestResultRef({ success: false, output: '', error: 'Failed to run tests' })
     } finally {
       setRunning(false)
     }
@@ -113,6 +130,9 @@ export default function NewReview() {
     const newUpdates = { ...updates }
     if ('solution' in updates || 'unit_tests' in updates) {
       ;(newUpdates as any).lastRunSuccessful = false
+    }
+    if ('sota_solution' in updates || 'unit_tests' in updates) {
+      ;(newUpdates as any).sota_correct = false
     }
     setItem(prev => ({ ...prev, ...newUpdates }))
     setHasUnsavedChanges(true)
@@ -129,9 +149,14 @@ export default function NewReview() {
     updateItem({ topics: item.topics.filter(topic => topic !== topicToRemove) })
   }
 
-  const clearSolutionComments = () => {
+  const clearRefSolutionComments = () => {
     const cleaned = clearCommentsAndDocstrings(item.solution)
     updateItem({ solution: cleaned })
+  }
+
+  const clearSotaSolutionComments = () => {
+    const cleaned = clearCommentsAndDocstrings(item.sota_solution)
+    updateItem({ sota_solution: cleaned })
   }
 
   const clearTestComments = () => {
@@ -198,6 +223,18 @@ export default function NewReview() {
               <Textarea id="space_complexity" placeholder="e.g., O(n)..." value={item.space_complexity} onChange={(e) => updateItem({ space_complexity: e.target.value })} onInput={handleAutoResize} className="resize-none overflow-y-hidden" />
             </div>
             <div>
+              <Label htmlFor="sota_time_complexity">SOTA Time Complexity</Label>
+              <Textarea id="sota_time_complexity" placeholder="e.g., O(n log n)..." value={item.sota_time_complexity} onChange={(e) => updateItem({ sota_time_complexity: e.target.value })} onInput={handleAutoResize} className="resize-none overflow-y-hidden" />
+            </div>
+            <div>
+              <Label htmlFor="sota_space_complexity">SOTA Space Complexity</Label>
+              <Textarea id="sota_space_complexity" placeholder="e.g., O(n)..." value={item.sota_space_complexity} onChange={(e) => updateItem({ sota_space_complexity: e.target.value })} onInput={handleAutoResize} className="resize-none overflow-y-hidden" />
+            </div>
+            <div className="flex items-center space-x-2">
+              <Checkbox id="sota_correct" checked={item.sota_correct} onCheckedChange={checked => updateItem({ sota_correct: !!checked })} />
+              <Label htmlFor="sota_correct">SOTA Correct</Label>
+            </div>
+            <div>
               <Label>Topics</Label>
               <TopicsEditor topics={item.topics} newTopic={newTopic} setNewTopic={setNewTopic} onAddTopic={addTopic} onRemoveTopic={removeTopic} />
             </div>
@@ -206,20 +243,26 @@ export default function NewReview() {
 
         <TestExecutionPanel
           lastRunSuccessful={item.lastRunSuccessful}
+          sotaCorrect={item.sota_correct}
           running={running}
           onRun={runTests}
           runDisabled={!item.solution.trim() || !item.unit_tests.trim()}
-          testResult={testResult}
+          testResultRef={testResultRef}
+          testResultSota={testResultSota}
           copyPayload={{
             prompt: item.prompt || '',
             inputs: item.inputs || '',
             outputs: item.outputs || '',
             solution: item.solution || '',
             unit_tests: item.unit_tests || '',
+            sota_solution: item.sota_solution || '',
           }}
         />
 
-        <CodeEditorPanel title="Solution Code" code={item.solution} onChange={code => updateItem({ solution: code })} onClear={clearSolutionComments} clearDisabled={!item.solution} placeholder="def solution(): ..." />
+        <div className="grid grid-rows-2 overflow-hidden">
+          <CodeEditorPanel title="SOTA Solution" code={item.sota_solution} onChange={code => updateItem({ sota_solution: code })} onClear={clearSotaSolutionComments} clearDisabled={!item.sota_solution} placeholder="def solution(): ..." />
+          <CodeEditorPanel title="Reference Solution" code={item.solution} onChange={code => updateItem({ solution: code })} onClear={clearRefSolutionComments} clearDisabled={!item.solution} placeholder="def solution(): ..." />
+        </div>
 
         <CodeEditorPanel title="Unit Tests" code={item.unit_tests} onChange={code => updateItem({ unit_tests: code })} onClear={clearTestComments} clearDisabled={!item.unit_tests} placeholder="def test_solution(): ..." />
       </main>
