@@ -181,10 +181,12 @@ export function useReviewItem(id: string, router: any) {
   const shouldCompressToBase = (base: VersionNode | undefined | null) => {
     // Only allow "in-place" updates when:
     // 1) we're authenticated
-    // 2) base exists AND is the current head
+    // 2) base exists and is a leaf (no other edits branched from it)
     // 3) the same editor is making a back-to-back edit (no credit stealing)
     if (!item || !base || status !== "authenticated" || !user) return false;
-    if (base.id !== item.currentVersionId) return false; // never compress non-head or branched nodes
+    // If any version uses this node as its parent, it's not safe to compress.
+    const hasChildren = versions.some(v => v.parentId === base.id);
+    if (hasChildren) return false;
 
     const me = identity();
     const info = parseStandardLabel(base.label);
@@ -193,7 +195,7 @@ export function useReviewItem(id: string, router: any) {
         (!info.editor && base.authorId && base.authorId === user.id);
 
     return !!sameEditor;
-    };
+  };
   // Single-call atomic save helper: creates or updates a version, promotes to head, mirrors dataset
   const atomicSave = async (snapshot: Partial<DatasetItem>, baseId: string | null, label: string) => {
     if (!item) return null;
