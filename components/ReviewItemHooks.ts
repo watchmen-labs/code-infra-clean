@@ -21,7 +21,8 @@ export function useReviewItem(id: string, router: any) {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [running, setRunning] = useState(false);
-  const [testResult, setTestResult] = useState<TestResult | null>(null);
+  const [testResultRef, setTestResultRef] = useState<TestResult | null>(null);
+  const [testResultSota, setTestResultSota] = useState<TestResult | null>(null);
   const [newTopic, setNewTopic] = useState("");
   const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false);
   const [isSuggestingTopics, setIsSuggestingTopics] = useState(false);
@@ -56,8 +57,12 @@ export function useReviewItem(id: string, router: any) {
         code_file: d.code_file ?? "",
         unit_tests: d.unit_tests ?? "",
         solution: d.solution ?? "",
+        sota_solution: d.sota_solution ?? "",
         time_complexity: d.time_complexity ?? "",
         space_complexity: d.space_complexity ?? "",
+        sota_time_complexity: d.sota_time_complexity ?? "",
+        sota_space_complexity: d.sota_space_complexity ?? "",
+        sota_correct: d.sota_correct ?? false,
         topics: Array.isArray(d.topics) ? (d.topics as string[]) : [],
         difficulty: (d.difficulty as any) || prev.difficulty,
         notes: d.notes ?? prev.notes ?? ""
@@ -248,8 +253,13 @@ export function useReviewItem(id: string, router: any) {
       code_file: item.code_file || "",
       unit_tests: item.unit_tests || "",
       solution: item.solution || "",
+      sota_solution: item.sota_solution || "",
       time_complexity: item.time_complexity || "",
       space_complexity: item.space_complexity || "",
+      sota_time_complexity: item.sota_time_complexity || "",
+      sota_space_complexity: item.sota_space_complexity || "",
+      sota_correct: item.sota_correct || false,
+      lastRunSuccessful: item.lastRunSuccessful || false,
       topics: item.topics || [],
       difficulty: item.difficulty || "Easy",
       notes: item.notes || ""
@@ -301,16 +311,20 @@ export function useReviewItem(id: string, router: any) {
         prompt: item.prompt || "",
         inputs: item.inputs || "",
         outputs: item.outputs || "",
-        code_file: item.code_file || "",
-        unit_tests: item.unit_tests || "",
-        solution: item.solution || "",
-        time_complexity: item.time_complexity || "",
-        space_complexity: item.space_complexity || "",
-        topics: item.topics || [],
-        difficulty: item.difficulty || "Easy",
-        notes: item.notes || "",
-        lastRunSuccessful: item.lastRunSuccessful || false
-      };
+      code_file: item.code_file || "",
+      unit_tests: item.unit_tests || "",
+      solution: item.solution || "",
+      sota_solution: item.sota_solution || "",
+      time_complexity: item.time_complexity || "",
+      space_complexity: item.space_complexity || "",
+      sota_time_complexity: item.sota_time_complexity || "",
+      sota_space_complexity: item.sota_space_complexity || "",
+      sota_correct: item.sota_correct || false,
+      topics: item.topics || [],
+      difficulty: item.difficulty || "Easy",
+      notes: item.notes || "",
+      lastRunSuccessful: item.lastRunSuccessful || false
+    };
       const me = identity();
       await atomicSave(
         payload,
@@ -340,14 +354,20 @@ export function useReviewItem(id: string, router: any) {
   const runTests = async () => {
     if (!item) return;
     setRunning(true);
-    setTestResult(null);
-    const result = await runAutograder({ solution: item.solution, tests: item.unit_tests });
-    setTestResult(result as TestResult);
-    const updatedItem = { ...item, lastRunSuccessful: result.success };
+    setTestResultRef(null);
+    setTestResultSota(null);
+    let sotaRes: TestResult | null = null;
+    if (item.sota_solution) {
+      sotaRes = await runAutograder({ solution: item.sota_solution, tests: item.unit_tests }) as TestResult;
+      setTestResultSota(sotaRes);
+    }
+    const refRes = await runAutograder({ solution: item.solution, tests: item.unit_tests }) as TestResult;
+    setTestResultRef(refRes);
+    const updatedItem = { ...item, lastRunSuccessful: refRes.success, sota_correct: sotaRes ? sotaRes.success : item.sota_correct };
     setItem(updatedItem as DatasetItem);
     setHasUnsavedChanges(true);
     setRunning(false);
-    return result;
+    return { ref: refRes, sota: sotaRes };
 
     // try {
     //   const response = await fetch("/api/run-tests", {
@@ -377,9 +397,12 @@ export function useReviewItem(id: string, router: any) {
 
   const updateItem = (updates: Partial<DatasetItem>) => {
     if (!item) return;
-    const newUpdates: Partial<DatasetItem & { lastRunSuccessful: boolean }> = { ...updates };
+    const newUpdates: Partial<DatasetItem & { lastRunSuccessful: boolean; sota_correct: boolean }> = { ...updates };
     if ("solution" in updates || "unit_tests" in updates) {
       newUpdates.lastRunSuccessful = false;
+    }
+    if ("sota_solution" in updates || "unit_tests" in updates) {
+      newUpdates.sota_correct = false;
     }
     setItem(prev => (prev ? { ...prev, ...newUpdates } : null));
     setHasUnsavedChanges(true);
@@ -422,6 +445,12 @@ export function useReviewItem(id: string, router: any) {
     updateItem({ solution: cleaned });
   };
 
+  const clearSotaSolutionComments = () => {
+    if (!item) return;
+    const cleaned = clearCommentsAndDocstrings(item.sota_solution ?? "");
+    updateItem({ sota_solution: cleaned });
+  };
+
   const clearTestComments = () => {
     if (!item) return;
     const cleaned = clearCommentsAndDocstrings(item.unit_tests ?? "");
@@ -446,7 +475,8 @@ export function useReviewItem(id: string, router: any) {
     loading,
     saving,
     running,
-    testResult,
+    testResultRef,
+    testResultSota,
     newTopic, setNewTopic,
     hasUnsavedChanges,
     isSuggestingTopics,
@@ -486,8 +516,13 @@ export function useReviewItem(id: string, router: any) {
             code_file: item.code_file || "",
             unit_tests: item.unit_tests || "",
             solution: item.solution || "",
+            sota_solution: item.sota_solution || "",
             time_complexity: item.time_complexity || "",
             space_complexity: item.space_complexity || "",
+            sota_time_complexity: item.sota_time_complexity || "",
+            sota_space_complexity: item.sota_space_complexity || "",
+            sota_correct: item.sota_correct || false,
+            lastRunSuccessful: item.lastRunSuccessful || false,
             topics: item.topics || [],
             difficulty: item.difficulty || "Easy",
             notes: item.notes || ""
@@ -521,6 +556,7 @@ export function useReviewItem(id: string, router: any) {
     removeTopic,
     suggestTopics,
     clearSolutionComments,
+    clearSotaSolutionComments,
     clearTestComments,
 
     // header derived

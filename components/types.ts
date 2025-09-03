@@ -5,11 +5,15 @@ export interface DatasetItem {
   outputs: string
   unit_tests: string
   solution: string
+  sota_solution: string
   code_file?: string
   language?: string
   group?: string | null
   time_complexity: string
   space_complexity: string
+  sota_time_complexity: string
+  sota_space_complexity: string
+  sota_correct: boolean
   topics: string[]
   difficulty: 'Easy' | 'Medium' | 'Hard'
   notes: string

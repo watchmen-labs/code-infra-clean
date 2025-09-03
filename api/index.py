@@ -263,8 +263,6 @@ TASK_KEYS = [
     "group",
     "difficulty",
     "topics",
-    "time_complexity",
-    "space_complexity",
 ]
 
 
@@ -293,6 +291,10 @@ def _flatten_dataset_row(row: dict) -> dict:
             v = row.get(k)
             if v is not None:
                 meta[k] = v
+    # Backfill historical columns for complexity fields if present top-level
+    for k in ["time_complexity", "space_complexity", "sota_time_complexity", "sota_space_complexity"]:
+        if k not in meta and row.get(k) is not None:
+            meta[k] = row.get(k)
     out = {"id": row.get("id")}
     out.update(meta)
     out["notes"] = row.get("notes", "") or ""
@@ -310,11 +312,15 @@ def _row_from_generic_payload(payload, now):
         "outputs": payload.get("outputs", "") or "",
         "unit_tests": payload.get("unit_tests", "") or "",
         "solution": payload.get("solution") or payload.get("reference_solution") or "",
+        "sota_solution": payload.get("sota_solution", "") or "",
         "code_file": payload.get("code_file", "") or "",
         "language": payload.get("language"),
         "group": payload.get("group"),
         "time_complexity": payload.get("time_complexity", "") or "",
         "space_complexity": payload.get("space_complexity", "") or "",
+        "sota_time_complexity": payload.get("sota_time_complexity", "") or "",
+        "sota_space_complexity": payload.get("sota_space_complexity", "") or "",
+        "sota_correct": bool(payload.get("sota_correct", False)),
         "topics": _normalize_topics(payload.get("topics")),
         "difficulty": _normalize_difficulty(payload.get("difficulty")),
     }
@@ -329,8 +335,6 @@ def _row_from_generic_payload(payload, now):
         "group": meta["group"],
         "difficulty": meta["difficulty"],
         "topics": meta["topics"],
-        "time_complexity": meta["time_complexity"],
-        "space_complexity": meta["space_complexity"],
         "notes": payload.get("notes", "") or "",
         "lastRunSuccessful": bool(payload.get("lastRunSuccessful", False)),
         "createdAt": now,
@@ -356,17 +360,21 @@ def _normalize_snapshot_fields(snapshot: dict) -> dict:
     if "difficulty" in s:
         s["difficulty"] = _normalize_difficulty(s.get("difficulty"))
     # ensure string fields are not None
-    for k in ["prompt", "inputs", "outputs", "unit_tests", "solution",
-              "code_file", "time_complexity", "space_complexity", "notes"]:
+    for k in ["prompt", "inputs", "outputs", "unit_tests", "solution", "sota_solution",
+              "code_file", "time_complexity", "space_complexity", "sota_time_complexity", "sota_space_complexity", "notes"]:
         if k in s and s[k] is None:
             s[k] = ""
+    if "sota_correct" in s:
+        s["sota_correct"] = bool(s.get("sota_correct"))
+    if "lastRunSuccessful" in s:
+        s["lastRunSuccessful"] = bool(s.get("lastRunSuccessful"))
     return s
 
 def _merge_meta_with_snapshot(existing_meta: dict, snapshot: dict) -> dict:
     merged = dict(existing_meta or {})
-    for k in TASK_KEYS:
-        if k in snapshot:
-            merged[k] = snapshot[k]
+    for k, v in (snapshot or {}).items():
+        if k not in ("notes", "lastRunSuccessful"):
+            merged[k] = v
     return merged
 
 def _ensure_rows_updated(resp, table: str, match_info: dict):
@@ -388,8 +396,12 @@ def _snapshot_from_row(row: dict) -> dict:
         "code_file": meta.get("code_file", ""),
         "unit_tests": meta.get("unit_tests", ""),
         "solution": meta.get("solution", ""),
+        "sota_solution": meta.get("sota_solution", ""),
         "time_complexity": meta.get("time_complexity", ""),
         "space_complexity": meta.get("space_complexity", ""),
+        "sota_time_complexity": meta.get("sota_time_complexity", ""),
+        "sota_space_complexity": meta.get("sota_space_complexity", ""),
+        "sota_correct": meta.get("sota_correct", False),
         "topics": meta.get("topics", []),
         "difficulty": meta.get("difficulty", "Easy"),
         "notes": row.get("notes", "") or "",
@@ -417,6 +429,7 @@ def _sync_dataset_with_snapshot(item_id: str, snapshot: dict, *, set_current_ver
         "meta": merged_meta,
         "notes": norm.get("notes", existing.get("notes", "") or ""),
         "updatedAt": now,
+        "lastRunSuccessful": norm.get("lastRunSuccessful", existing.get("lastRunSuccessful", False)),
     }
     if set_current_version_id is not None:
         updates["currentVersionId"] = set_current_version_id
@@ -1165,11 +1178,15 @@ def import_dataset_csv():
                     "outputs": r.get("outputs"),
                     "code_file": r.get("code_file"),
                     "reference_solution": r.get("reference_solution") or r.get("solution"),
+                    "sota_solution": r.get("sota_solution"),
                     "unit_tests": r.get("unit_tests"),
                     "difficulty": r.get("difficulty"),
                     "topics": r.get("topics"),
                     "time_complexity": r.get("time_complexity"),
                     "space_complexity": r.get("space_complexity"),
+                    "sota_time_complexity": r.get("sota_time_complexity"),
+                    "sota_space_complexity": r.get("sota_space_complexity"),
+                    "sota_correct": r.get("sota_correct"),
                     "notes": r.get("notes"),
                     "group": r.get("group"),
                     "lastRunSuccessful": False
@@ -1183,11 +1200,15 @@ def import_dataset_csv():
                 "code_file": payload.get("code_file"),
                 "reference_solution": payload.get("reference_solution"),
                 "solution": payload.get("solution"),
+                "sota_solution": payload.get("sota_solution"),
                 "unit_tests": payload.get("unit_tests"),
                 "difficulty": meta.get("difficulty", payload.get("difficulty")),
                 "topics": meta.get("topics", payload.get("topics")),
                 "time_complexity": meta.get("time_complexity", payload.get("time_complexity")),
                 "space_complexity": meta.get("space_complexity", payload.get("space_complexity")),
+                "sota_time_complexity": meta.get("sota_time_complexity", payload.get("sota_time_complexity")),
+                "sota_space_complexity": meta.get("sota_space_complexity", payload.get("sota_space_complexity")),
+                "sota_correct": meta.get("sota_correct", payload.get("sota_correct")),
                 "group": payload.get("group"),
                 "notes": payload.get("notes", r.get("notes") or ""),
                 "lastRunSuccessful": bool(payload.get("lastRunSuccessful", False)),
@@ -1255,11 +1276,15 @@ def import_dataset_jsonl():
                 "code_file": obj.get("code_file"),
                 "reference_solution": obj.get("reference_solution"),
                 "solution": obj.get("solution"),
+                "sota_solution": obj.get("sota_solution"),
                 "unit_tests": obj.get("unit_tests"),
                 "difficulty": meta.get("difficulty", obj.get("difficulty")),
                 "topics": meta.get("topics", obj.get("topics")),
                 "time_complexity": meta.get("time_complexity", obj.get("time_complexity")),
                 "space_complexity": meta.get("space_complexity", obj.get("space_complexity")),
+                "sota_time_complexity": meta.get("sota_time_complexity", obj.get("sota_time_complexity")),
+                "sota_space_complexity": meta.get("sota_space_complexity", obj.get("sota_space_complexity")),
+                "sota_correct": meta.get("sota_correct", obj.get("sota_correct")),
                 "group": obj.get("group"),
                 "notes": obj.get("notes", ""),
                 "lastRunSuccessful": bool(obj.get("lastRunSuccessful", False)),

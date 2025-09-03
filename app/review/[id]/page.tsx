@@ -30,7 +30,8 @@ export default function ReviewItemPage() {
     loading,
     saving,
     running,
-    testResult,
+    testResultRef,
+    testResultSota,
     newTopic, setNewTopic,
     hasUnsavedChanges,
     isSuggestingTopics,
@@ -48,6 +49,7 @@ export default function ReviewItemPage() {
     removeTopic,
     suggestTopics,
     clearSolutionComments,
+    clearSotaSolutionComments,
     clearTestComments,
     headStamped,
     headDisplay,
@@ -58,7 +60,7 @@ export default function ReviewItemPage() {
   // resize textareas when switching versions/items
   useLayoutEffect(() => {
     if (!item) return;
-    const ids = ["prompt", "inputs", "outputs", "notes", "time_complexity", "space_complexity"];
+    const ids = ["prompt", "inputs", "outputs", "notes", "time_complexity", "space_complexity", "sota_time_complexity", "sota_space_complexity"];
     ids.forEach(k => {
       const el = document.getElementById(k) as HTMLTextAreaElement | null;
       if (el) resizeTextarea(el);
@@ -127,26 +129,39 @@ export default function ReviewItemPage() {
 
         <TestExecutionPanel
           lastRunSuccessful={!!item.lastRunSuccessful}
+          sotaCorrect={item.sota_correct}
           running={running}
           onRun={runTests}
-          testResult={testResult}
+          testResultRef={testResultRef}
+          testResultSota={testResultSota}
           copyPayload={{
             prompt: item.prompt ?? "",
             inputs: item.inputs ?? "",
             outputs: item.outputs ?? "",
             solution: item.solution ?? "",
-            unit_tests: item.unit_tests ?? ""
+            unit_tests: item.unit_tests ?? "",
+            sota_solution: item.sota_solution ?? ""
           }}
         />
 
-        <CodeEditorPanel
-          title="Solution Code"
-          code={item.solution ?? ""}
-          onChange={code => updateItem({ solution: code })}
-          onClear={clearSolutionComments}
-          clearDisabled={!(item.solution ?? "")}
-          placeholder="def solution(): ..."
-        />
+        <div className="grid grid-rows-2 overflow-hidden">
+          <CodeEditorPanel
+            title="SOTA Solution"
+            code={item.sota_solution ?? ""}
+            onChange={code => updateItem({ sota_solution: code })}
+            onClear={clearSotaSolutionComments}
+            clearDisabled={!(item.sota_solution ?? "")}
+            placeholder="def solution(): ..."
+          />
+          <CodeEditorPanel
+            title="Reference Solution"
+            code={item.solution ?? ""}
+            onChange={code => updateItem({ solution: code })}
+            onClear={clearSolutionComments}
+            clearDisabled={!(item.solution ?? "")}
+            placeholder="def solution(): ..."
+          />
+        </div>
 
         <CodeEditorPanel
           title="Unit Tests"

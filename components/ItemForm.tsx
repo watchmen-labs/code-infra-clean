@@ -12,6 +12,7 @@ import {
   SelectTrigger,
   SelectValue
 } from "@/components/ui/select";
+import { Checkbox } from "@/components/ui/checkbox";
 import TopicsEditor from "@/components/TopicsEditor";
 import { DatasetItem } from "@/components/types";
 
@@ -142,6 +143,34 @@ export default function ItemForm({
             onInput={onAutoResize}
             className="resize-none overflow-y-hidden"
           />
+        </div>
+        <div>
+          <Label htmlFor="sota_time_complexity">SOTA Time Complexity</Label>
+          <Textarea
+            key={`${item.id}-${selectedVersionId}-sota-time`}
+            id="sota_time_complexity"
+            value={v(item.sota_time_complexity)}
+            onChange={e => updateItem({ sota_time_complexity: e.target.value })}
+            placeholder="e.g., O(n log n)..."
+            onInput={onAutoResize}
+            className="resize-none overflow-y-hidden"
+          />
+        </div>
+        <div>
+          <Label htmlFor="sota_space_complexity">SOTA Space Complexity</Label>
+          <Textarea
+            key={`${item.id}-${selectedVersionId}-sota-space`}
+            id="sota_space_complexity"
+            value={v(item.sota_space_complexity)}
+            onChange={e => updateItem({ sota_space_complexity: e.target.value })}
+            placeholder="e.g., O(n)..."
+            onInput={onAutoResize}
+            className="resize-none overflow-y-hidden"
+          />
+        </div>
+        <div className="flex items-center space-x-2">
+          <Checkbox id="sota_correct" checked={item.sota_correct} onCheckedChange={checked => updateItem({ sota_correct: !!checked })} />
+          <Label htmlFor="sota_correct">SOTA Correct</Label>
         </div>
         <div>
           <Label>Topics</Label>
