@@ -831,17 +831,35 @@ def atomic_save(item_id):
             return jsonify({"error": "Missing 'data'"}), 400
 
         now = datetime.now().isoformat()
-          # Enforce: only compress the current head
-        try:
-            ds_res = supabase.table('dataset').select('currentVersionId').eq('id', item_id).single().execute()
-            ds = getattr(ds_res, "data", None) or {}
-            current_head = ds.get("currentVersionId")
-        except Exception:
-            current_head = None
 
-        if compress_into and compress_into != current_head:
-            # Treat as a new version instead of mutating history
-            compress_into = None
+        if compress_into:
+            # Only allow in-place mutation if the version is a leaf owned by the requester.
+            try:
+                vres = (
+                    supabase.table('task_versions')
+                    .select('id,author_id')
+                    .eq('id', compress_into)
+                    .eq('item_id', item_id)
+                    .single()
+                    .execute()
+                )
+                vrow = getattr(vres, 'data', None) or {}
+                if vrow.get('author_id') != uid:
+                    compress_into = None
+                else:
+                    child_res = (
+                        supabase.table('task_versions')
+                        .select('id')
+                        .eq('parent_id', compress_into)
+                        .eq('item_id', item_id)
+                        .limit(1)
+                        .execute()
+                    )
+                    if getattr(child_res, 'data', []) :
+                        compress_into = None
+            except Exception:
+                compress_into = None
+
         if compress_into:
             # Update existing version in place
             patch = {"data": snapshot}
