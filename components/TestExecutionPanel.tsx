@@ -3,7 +3,7 @@
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import { Play, CheckCircle, XCircle, Clock, Copy, ClipboardCheck, ClipboardList } from 'lucide-react'
+import { Play, CheckCircle, XCircle, Clock, Copy, ClipboardCheck, ClipboardList, ClipboardCopy } from 'lucide-react'
 import { useState } from 'react'
 
 interface TestResult {
@@ -44,7 +44,9 @@ export default function TestExecutionPanel({
   testResultSota,
   copyPayload,
 }: Props) {
-  const [copied, setCopied] = useState<null | 'qio' | 'solution' | 'tests' | 'sota'>(null)
+  const [copied, setCopied] = useState<
+    null | 'qio' | 'solution' | 'tests' | 'sota' | 'both'
+  >(null)
 
   const baseText = () => {
     const p = copyPayload?.prompt?.trim() ?? ''
@@ -72,12 +74,24 @@ export default function TestExecutionPanel({
     return `${baseText()}\n\nTests:\n\`\`\`\n${t}\n\`\`\``
   }
 
-  const doCopy = async (kind: 'qio' | 'solution' | 'tests' | 'sota') => {
+  const withBothSolutionsOnly = () => {
+    const ref = copyPayload?.solution ?? ''
+    const sota = copyPayload?.sota_solution ?? ''
+    return [
+      ref && `Reference Solution:\n\`\`\`\n${ref}\n\`\`\``,
+      sota && `SOTA Solution:\n\`\`\`\n${sota}\n\`\`\``,
+    ]
+      .filter(Boolean)
+      .join('\n\n')
+  }
+
+  const doCopy = async (kind: 'qio' | 'solution' | 'tests' | 'sota' | 'both') => {
     let text = ''
     if (kind === 'qio') text = baseText()
     if (kind === 'solution') text = withRefSolution()
     if (kind === 'sota') text = withSotaSolution()
     if (kind === 'tests') text = withTests()
+    if (kind === 'both') text = withBothSolutionsOnly()
 
     try {
       await navigator.clipboard.writeText(text)
@@ -128,13 +142,13 @@ export default function TestExecutionPanel({
               type="button"
               size="sm"
               variant="outline"
-              className="whitespace-nowrap bg-blue-50 text-blue-700 border-blue-200 hover:bg-blue-100"
+              className="h-8 px-2 text-xs whitespace-nowrap bg-blue-50 text-blue-700 border-blue-200 hover:bg-blue-100"
               onClick={() => doCopy('qio')}
               title="Copy Problem + Inputs + Outputs"
               aria-label="Copy Problem, Inputs, and Outputs"
             >
-              <Copy className="w-4 h-4 mr-1" />
-              Copy Q/I/O
+              <Copy className="w-3 h-3 mr-1" />
+              Q/I/O
               {copied === 'qio' && (
                 <Badge className="ml-2 bg-blue-600 text-white">Copied</Badge>
               )}
@@ -144,13 +158,13 @@ export default function TestExecutionPanel({
               type="button"
               size="sm"
               variant="outline"
-              className="whitespace-nowrap bg-orange-50 text-orange-700 border-orange-200 hover:bg-orange-100"
+              className="h-8 px-2 text-xs whitespace-nowrap bg-orange-50 text-orange-700 border-orange-200 hover:bg-orange-100"
               onClick={() => doCopy('sota')}
               title="Copy with SOTA Solution (triple backticks)"
               aria-label="Copy with SOTA Solution"
             >
-              <ClipboardCheck className="w-4 h-4 mr-1" />
-              Copy + SOTA
+              <ClipboardCheck className="w-3 h-3 mr-1" />
+              SOTA
               {copied === 'sota' && (
                 <Badge className="ml-2 bg-orange-600 text-white">Copied</Badge>
               )}
@@ -160,13 +174,13 @@ export default function TestExecutionPanel({
               type="button"
               size="sm"
               variant="outline"
-              className="whitespace-nowrap bg-green-50 text-green-700 border-green-200 hover:bg-green-100"
+              className="h-8 px-2 text-xs whitespace-nowrap bg-green-50 text-green-700 border-green-200 hover:bg-green-100"
               onClick={() => doCopy('solution')}
               title="Copy with Reference Solution (triple backticks)"
               aria-label="Copy with Reference Solution"
             >
-              <ClipboardCheck className="w-4 h-4 mr-1" />
-              Copy + Ref
+              <ClipboardCheck className="w-3 h-3 mr-1" />
+              Ref
               {copied === 'solution' && (
                 <Badge className="ml-2 bg-green-600 text-white">Copied</Badge>
               )}
@@ -176,13 +190,29 @@ export default function TestExecutionPanel({
               type="button"
               size="sm"
               variant="outline"
-              className="whitespace-nowrap bg-purple-50 text-purple-700 border-purple-200 hover:bg-purple-100"
+              className="h-8 px-2 text-xs whitespace-nowrap bg-teal-50 text-teal-700 border-teal-200 hover:bg-teal-100"
+              onClick={() => doCopy('both')}
+              title="Copy both solutions (triple backticks)"
+              aria-label="Copy SOTA and Reference Solutions"
+            >
+              <ClipboardCopy className="w-3 h-3 mr-1" />
+              Both
+              {copied === 'both' && (
+                <Badge className="ml-2 bg-teal-600 text-white">Copied</Badge>
+              )}
+            </Button>
+
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              className="h-8 px-2 text-xs whitespace-nowrap bg-purple-50 text-purple-700 border-purple-200 hover:bg-purple-100"
               onClick={() => doCopy('tests')}
               title="Copy with Tests (triple backticks)"
               aria-label="Copy with Tests"
             >
-              <ClipboardList className="w-4 h-4 mr-1" />
-              Copy + Tests
+              <ClipboardList className="w-3 h-3 mr-1" />
+              Tests
               {copied === 'tests' && (
                 <Badge className="ml-2 bg-purple-600 text-white">Copied</Badge>
               )}
