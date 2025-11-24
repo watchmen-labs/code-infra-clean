@@ -7,10 +7,13 @@ import { DatasetItemsList } from '@/components/dataset-items-list'
 import { ExportModal } from '@/components/export-modal'
 import { GroupsSection } from '@/components/groups-section'
 import { LoadingState } from '@/components/loading-state'
+import { useAuth } from '@/components/auth-context'
+import { Button } from '@/components/ui/button'
 import ImportControls from './ImportControls'
 import { useDatasetDashboard } from './useDatasetDashboard'
 
 export default function DashboardPage() {
+  const { logout } = useAuth()
   const {
     // data
     items, analytics, loading,
@@ -36,6 +39,11 @@ export default function DashboardPage() {
 
   return (
     <div className="container mx-auto p-6 space-y-6">
+      <div className="flex justify-end">
+        <Button variant="outline" onClick={logout}>
+          Log out
+        </Button>
+      </div>
       {/* Export modal */}
       <ExportModal
         isOpen={isExportModalOpen}
