@@ -378,6 +378,17 @@ def _merge_meta_with_snapshot(existing_meta: dict, snapshot: dict) -> dict:
     return merged
 
 def _ensure_rows_updated(resp, table: str, match_info: dict):
+    err = getattr(resp, "error", None)
+    if err:
+        status = getattr(err, "status_code", None) or getattr(err, "code", None) or 500
+        try:
+            code = int(status)
+        except Exception:
+            code = 500
+        http_exc = HTTPException(description=getattr(err, "message", None) or str(err))
+        http_exc.code = code
+        raise http_exc
+
     data = getattr(resp, "data", None)
     if not data:
         logger.error(
@@ -415,6 +426,8 @@ def _sync_dataset_with_snapshot(item_id: str, snapshot: dict, *, set_current_ver
     """
     # Fetch existing row to preserve unknown meta keys and notes
     res = supabase.table('dataset').select('*').eq('id', item_id).single().execute()
+    if getattr(res, "error", None):
+        _ensure_rows_updated(res, "dataset", {"id": item_id})
     existing = getattr(res, "data", None)
     if not existing:
         return None
@@ -919,6 +932,8 @@ def atomic_save(item_id):
                 "created_at": now
             }
             res = supabase.table('task_versions').insert(row).execute()
+            if getattr(res, "error", None):
+                _ensure_rows_updated(res, "task_versions", {"item_id": item_id})
             created = (getattr(res, "data", []) or [])[0]
             version_id = created.get("id")
             inserted = True
