@@ -212,8 +212,8 @@ export function useReviewItem(id: string, router: any) {
         compressIntoVersionId: compressIntoVersionId || undefined
       })
     });
-    if (!res.ok) return null;
-    const payload = await res.json();
+    const payload = await res.json().catch(() => null);
+    if (!res.ok || payload?.success !== true) return null;
 
     // Mirror dataset row (already in response) to local state/cache
     if (payload.dataset) {
@@ -242,7 +242,6 @@ export function useReviewItem(id: string, router: any) {
       setSelectedVersionId(compressIntoVersionId);
       setEditedFromVersionId(compressIntoVersionId);
     }
-    setHasUnsavedChanges(false);
     return payload;
   };
 
@@ -328,12 +327,15 @@ export function useReviewItem(id: string, router: any) {
       lastRunSuccessful: item.lastRunSuccessful || false
     };
       const me = identity();
-      await atomicSave(
+      const result = await atomicSave(
         payload,
         editedFromVersionId || selectedVersionId || null,
         formatStandardLabel(me, [])
       );
-      setHasUnsavedChanges(false);
+      if (result?.success) {
+        // Ensure the unsaved indicator clears only after a successful save.
+        setHasUnsavedChanges(false);
+      }
     } finally {
       setSaving(false);
     }
@@ -537,6 +539,10 @@ export function useReviewItem(id: string, router: any) {
             baseId,
             formatStandardLabel(me, [])
         );
+
+        if (savePayload?.success) {
+            setHasUnsavedChanges(false);
+        }
 
         // 2) Now stamp the *new* head (or compressed head) by adding me to stamps
         const newHeadId = (savePayload && savePayload.versionId) || item.currentVersionId || selectedVersionId;
