@@ -213,7 +213,12 @@ export function useReviewItem(id: string, router: any) {
       })
     });
     const payload = await res.json().catch(() => null);
-    if (!res.ok || payload?.success !== true) return null;
+    const ok =
+      res.ok &&
+      payload?.success === true &&
+      payload?.dataset &&
+      payload?.versionId;
+    if (!ok) return null;
 
     // Mirror dataset row (already in response) to local state/cache
     if (payload.dataset) {
