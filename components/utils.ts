@@ -133,82 +133,415 @@ export const clearJsComments = (code: string): string => {
 // Assumes you already have: detectLanguage(...) and clearJsComments(...)
 
 export const clearCommentsAndDocstrings = (code: string, language?: SupportedLanguage): string => {
-  const lang = language ?? detectLanguage(code);
-  if (lang === 'javascript') return clearJsComments(code);
-  return clearPythonWithRegexHeuristics(code);
+  if (!code || code.trim().length === 0) return code;
+  let cleaned = clearPythonWithRegexHeuristics(code, {
+    preserveWhitespace: false, // let it trim trailing spaces
+    // keep other defaults (docstrings removed, shebang/encoding preserved, etc.)
+  });
+
+
+  // Final normalization for BOTH languages:
+  // - remove trailing spaces
+  // - drop completely empty lines
+  cleaned = cleaned
+    .split(/\r?\n/)
+    .map(line => line.replace(/[ \t\f]+$/g, ''))
+    .filter(line => line.trim() !== '')
+    .join('\n');
+
+  return cleaned;
+};
+// clearPython.ts
+export interface ClearPythonOptions {
+  /** Remove docstrings for module/class/function. Default: true */
+  removeDocstrings?: boolean;
+  /** Keep the first-line shebang (#! ...). Default: true */
+  preserveShebang?: boolean;
+  /** Keep PEP 263 encoding cookie in line 1 or 2. Default: true */
+  preserveEncodingCookie?: boolean;
+  /** If the docstring is the only statement in a suite, insert `pass`. Default: true */
+  insertPassForEmptyBlocks?: boolean;
+  /** Keep original blank lines / trailing spaces. Default: true */
+  preserveWhitespace?: boolean;
+}
+
+const DEFAULTS: Required<ClearPythonOptions> = {
+  removeDocstrings: true,
+  preserveShebang: true,
+  preserveEncodingCookie: true,
+  insertPassForEmptyBlocks: true,
+  preserveWhitespace: true,
 };
 
-function clearPythonWithRegexHeuristics(input: string): string {
-  let src = input.replace(/\r\n?/g, '\n');
+export function clearPythonWithRegexHeuristics(
+  input: string,
+  options: ClearPythonOptions = {}
+): string {
+  const opt = { ...DEFAULTS, ...options };
+  const src = input;
+  const n = src.length;
 
-  // 1) Strip comments outside strings
-  // First alternatives match triple/single strings so '#...' inside them isn't treated as a comment.
-  const STRINGS_OR_COMMENT =
-    /(?:[rRuUbBfF]{0,3}(?:"""[\s\S]*?"""|'''[\s\S]*?''')|"(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*')|(#.*?$)/gm;
+  type Span = { start: number; end: number; text?: string };
+  const repls: Span[] = [];
 
-  src = src.replace(STRINGS_OR_COMMENT, (m, comment) => (comment ? '' : m));
+  // ---- small helpers -------------------------------------------------------
+  const isQuote = (c: string) => c === `"` || c === `'`;
+  const isPrefixChar = (c: string) =>
+    c === "r" || c === "R" || c === "f" || c === "F" || c === "b" || c === "B" || c === "u" || c === "U";
 
-  // Helper for a Python string literal (triple or single; with optional rRbBuUfF prefixes)
-  const STRING_LITERAL =
-    String.raw`(?:[rRuUbBfF]{0,3}(?:"""[\s\S]*?"""|'''[\s\S]*?'''|"(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*'))`;
+  const lineStarts: number[] = [0];
+  for (let i = 0; i < n; i++) if (src.charCodeAt(i) === 10) lineStarts.push(i + 1);
+  const lineOf = (pos: number) => {
+    let lo = 0, hi = lineStarts.length - 1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (lineStarts[mid] <= pos) {
+        if (mid + 1 >= lineStarts.length || lineStarts[mid + 1] > pos) return mid;
+        lo = mid + 1;
+      } else hi = mid - 1;
+    }
+    return 0;
+  };
+  const lineStartOf = (pos: number) => lineStarts[lineOf(pos)];
+  const lineEndOf = (pos: number) => {
+    const li = lineOf(pos);
+    return li + 1 < lineStarts.length ? lineStarts[li + 1] - 1 : n;
+  };
+  const startsWithAt = (i: number, s: string) => src.substr(i, s.length) === s;
+  const encodingCookieRe = /^\s*#.*coding[:=]\s*([-\w.]+)/;
 
-  // 2) Remove module docstring at file start (optionally wrapped in parentheses)
-  const MODULE_DOC_RE = new RegExp(
-    String.raw`^\s*(?:\(\s*)*${STRING_LITERAL}(?:\s*\))*\s*(?=\n|$)`,
-    'm'
-  );
-  src = src.replace(MODULE_DOC_RE, '');
-
-  // 3) Remove first-string statements inside classes/defs (docstrings).
-  //    We also handle decorators and blank lines between header and body.
-  const HEADER_AND_FIRST_STRING = new RegExp(
-    String.raw`^([ \t]*)(?:@[^\n]*\n\1(?:@[^\n]*\n\1)*)?` +        // decorators (same indent), optional
-    String.raw`(?:(?:async[ \t]+)?def|class)\b[\s\S]*?:[ \t]*\n` + // header up to ':' and newline
-    String.raw`(?:\1[ \t]*\n)*` +                                 // optional blank lines
-    String.raw`(?:\1([ \t]+))` +                                  // body indent (must be deeper than header)
-    String.raw`(?:\(\s*)*` +                                      // optional parentheses around the docstring
-    String.raw`(${STRING_LITERAL})` +                              // the candidate docstring
-    String.raw`(?:\s*\))*[ \t]*(?=\n|$)`,                         // closing parens/whitespace, then EOL
-    'gm'
-  );
-
-  const repls: Array<{ start: number; end: number; text: string }> = [];
-  let m: RegExpExecArray | null;
-
-  while ((m = HEADER_AND_FIRST_STRING.exec(src)) !== null) {
-    const whole = m[0];
-    const headerIndent = m[1] || '';
-    const bodyIndent = m[2] || '';
-    const stringLit  = m[3] || '';
-
-    // Sanity: docstring line must actually be more indented than the header.
-    if (!bodyIndent.startsWith(headerIndent) || bodyIndent.length <= headerIndent.length) continue;
-
-    // Locate the string literal span within the matched chunk
-    const local = whole.lastIndexOf(stringLit);
-    const start = (m.index || 0) + local;
-    const end   = start + stringLit.length;
-
-    // Insert 'pass' only if the block would be empty after removing the docstring.
-    const needsPass = !hasContentInBlock(src, end, headerIndent, bodyIndent);
-    repls.push({ start, end, text: needsPass ? bodyIndent + 'pass' : '' });
+  // ---- string & f-string scanners -----------------------------------------
+  function tryScanString(i: number): { end: number } | null {
+    let j = i;
+    while (j < n && isPrefixChar(src[j])) j++;
+    if (j >= n || !isQuote(src[j])) {
+      if (!isQuote(src[i])) return null;
+      j = i;
+    }
+    const quote = src[j];
+    const triple = j + 2 < n && src[j + 1] === quote && src[j + 2] === quote;
+    const prefix = src.substring(i, j);
+    const isF = /[fF]/.test(prefix);
+    const isRaw = /[rR]/.test(prefix);
+    const end = isF ? scanFString(j, quote, triple, isRaw) : scanPlainString(j, quote, triple, isRaw);
+    return { end };
   }
 
-  // Apply replacements from end to start to keep indices stable
-  if (repls.length) {
-    repls.sort((a, b) => b.start - a.start);
-    for (const r of repls) {
-      src = src.slice(0, r.start) + r.text + src.slice(r.end);
+  function scanPlainString(posAtQuote: number, quote: string, triple: boolean, isRaw: boolean): number {
+    let i = posAtQuote + (triple ? 3 : 1);
+    while (i < n) {
+      const c = src[i];
+      if (!isRaw && c === "\\") { i += 2; continue; }
+      if (triple) {
+        if (c === quote && i + 2 < n && src[i + 1] === quote && src[i + 2] === quote) return i + 3;
+        i++;
+      } else {
+        if (c === "\n" || c === "\r") return i;
+        if (c === quote) return i + 1;
+        i++;
+      }
+    }
+    return n;
+  }
+
+  function scanFString(posAtQuote: number, quote: string, triple: boolean, isRaw: boolean): number {
+    let i = posAtQuote + (triple ? 3 : 1);
+    while (i < n) {
+      const c = src[i];
+      if (!isRaw && c === "\\") { i += 2; continue; }
+      if (c === "{") {
+        if (i + 1 < n && src[i + 1] === "{") { i += 2; continue; }
+        i = scanFExpression(i + 1);
+        continue;
+      }
+      if (c === "}") {
+        if (i + 1 < n && src[i + 1] === "}") { i += 2; continue; }
+        i++; continue;
+      }
+      if (triple) {
+        if (c === quote && i + 2 < n && src[i + 1] === quote && src[i + 2] === quote) return i + 3;
+        i++;
+      } else {
+        if (c === "\n" || c === "\r") return i;
+        if (c === quote) return i + 1;
+        i++;
+      }
+    }
+    return n;
+  }
+
+  function scanFExpression(i: number): number {
+    let depthBrace = 1, depthParen = 0, depthBracket = 0;
+    while (i < n) {
+      const c = src[i];
+      if (isQuote(c) || (isPrefixChar(c) && i + 1 < n && isQuote(src[i + 1]))) {
+        const s = tryScanString(i)!;
+        i = s.end; continue;
+      }
+      if (c === "#") { i = lineEndOf(i); continue; }
+      if (c === "\\") {
+        const nxt = src[i + 1]; if (nxt === "\n" || nxt === "\r") { i += 2; continue; }
+      }
+      if (c === "(") { depthParen++; i++; continue; }
+      if (c === ")") { depthParen = Math.max(0, depthParen - 1); i++; continue; }
+      if (c === "[") { depthBracket++; i++; continue; }
+      if (c === "]") { depthBracket = Math.max(0, depthBracket - 1); i++; continue; }
+      if (c === "{") { depthBrace++; i++; continue; }
+      if (c === "}") { depthBrace--; i++; if (depthBrace === 0) return i; continue; }
+      i++;
+    }
+    return n;
+  }
+
+  // ---- pass 1: strip comments (preserve shebang/encoding if configured) ---
+  {
+    let i = 0, lineNo = 0;
+    while (i < n) {
+      const ls = i;
+      let le = lineEndOf(ls);
+      const isShebang = lineNo === 0 && startsWithAt(ls, "#!");
+      const maybeEnc = (lineNo === 0 || lineNo === 1) && encodingCookieRe.test(src.slice(ls, le));
+
+      let j = ls;
+      while (j < le) {
+        const s = tryScanString(j);
+        if (s) { j = s.end; continue; }
+        if (src[j] === "#") {
+          if ((opt.preserveShebang && isShebang) || (opt.preserveEncodingCookie && maybeEnc)) {
+            j = le; break;
+          }
+          repls.push({ start: j, end: le }); j = le; break;
+        }
+        j++;
+      }
+      lineNo++; i = le + 1;
     }
   }
 
-  // 4) Final tidy (preserve your original behavior)
-  return src
-    .split('\n')
-    .map(l => l.replace(/[ \t]+$/g, '')) // trim trailing whitespace
-    .filter(l => l.trim() !== '')        // drop empty lines
-    .join('\n');
+  // ---- pass 2: remove true docstrings (module/def/class) -------------------
+  if (opt.removeDocstrings) {
+    type Block = { indent: string; kind: "module" | "class" | "def" | "other"; firstPending: boolean };
+    const stack: Block[] = [{ indent: "", kind: "module", firstPending: true }];
+
+    const getIndentAt = (ls: number) => {
+      let i = ls, out = "";
+      const le = lineEndOf(ls);
+      while (i < le && (src[i] === " " || src[i] === "\t" || src[i] === "\f")) { out += src[i++]; }
+      return out;
+    };
+
+    const startsWithWord = (i: number, word: string) => {
+      if (!startsWithAt(i, word)) return false;
+      const before = i - 1 >= 0 ? src[i - 1] : "";
+      const after = i + word.length < n ? src[i + word.length] : "";
+      const isId = (ch: string) => /[A-Za-z0-9_]/.test(ch);
+      return !isId(before) && !isId(after);
+    };
+
+    const analyzeSimpleStatement = (a: number, b: number, ctx: Block) => {
+      // Optional "async"
+      let i = a; while (i < b && /\s/.test(src[i])) i++;
+      let sawAsync = false;
+      if (startsWithWord(i, "async")) { i += 5; while (i < b && /\s/.test(src[i])) i++; sawAsync = true; }
+
+      const isDef = startsWithWord(i, "def");
+      const isClass = startsWithWord(i, "class");
+      if ((isDef || isClass) && (sawAsync ? isDef : (isDef || isClass))) {
+        // Find the colon of the header at depth 0
+        let j = i, depth = 0, colonAt = -1;
+        while (j < b) {
+          const s = tryScanString(j);
+          if (s) { j = s.end; continue; }
+          const c = src[j];
+          if (c === "(" || c === "[" || c === "{") { depth++; j++; continue; }
+          if (c === ")" || c === "]" || c === "}") { depth = Math.max(0, depth - 1); j++; continue; }
+          if (c === ":" && depth === 0) { colonAt = j; break; }
+          if (c === "#") { j = b; break; } // comment tail
+          j++;
+        }
+        if (colonAt !== -1) {
+          const headerIndent = getIndentAt(lineStartOf(a));
+          // Determine if there are inline small statements after ':'
+          let k = colonAt + 1; while (k < b && (src[k] === " " || src[k] === "\t")) k++;
+          const sameLineSuite = k < b;
+          // Push block expecting first stmt
+          stack.push({ indent: headerIndent, kind: isDef ? "def" : "class", firstPending: true });
+
+          if (sameLineSuite) {
+            // The rest of [k,b) are small statements separated by ';'
+            let segStart = k;
+            while (segStart < b) {
+              let segEnd = segStart, depth2 = 0;
+              while (segEnd < b) {
+                const t = tryScanString(segEnd);
+                if (t) { segEnd = t.end; continue; }
+                const ch = src[segEnd];
+                if (ch === "(" || ch === "[" || ch === "{") { depth2++; segEnd++; continue; }
+                if (ch === ")" || ch === "]" || ch === "}") { depth2 = Math.max(0, depth2 - 1); segEnd++; continue; }
+                if (depth2 === 0 && ch === ";") break;
+                segEnd++;
+              }
+              maybeRemoveDocstring(segStart, segEnd, stack[stack.length - 1], /*isSameLine*/true);
+              if (segEnd < b && src[segEnd] === ";") segEnd++;
+              while (segEnd < b && (src[segEnd] === " " || src[segEnd] === "\t")) segEnd++;
+              segStart = segEnd;
+            }
+            stack.pop();
+          }
+          return;
+        }
+      }
+
+      // Ordinary simple statement
+      maybeRemoveDocstring(a, b, ctx, false);
+    };
+
+    const maybeRemoveDocstring = (a: number, b: number, ctx: Block, sameLineSuite: boolean) => {
+      if (!(ctx.kind === "module" || ctx.kind === "def" || ctx.kind === "class")) return;
+      if (!ctx.firstPending) return;
+
+      let i = a; while (i < b && /\s/.test(src[i])) i++;
+      let j = b; while (j > i && /\s/.test(src[j - 1])) j--;
+      if (i >= j) return;
+
+      // Peel parens that enclose the whole thing
+      const matchClosing = (openPos: number, endLimit: number) => {
+        const open = src[openPos], want = open === "(" ? ")" : open === "[" ? "]" : "}";
+        let p = openPos + 1, depth = 1;
+        while (p < endLimit) {
+          const s = tryScanString(p); if (s) { p = s.end; continue; }
+          const ch = src[p];
+          if (ch === open) { depth++; p++; continue; }
+          if (ch === want) { depth--; p++; if (depth === 0) return p; continue; }
+          if (ch === "#") { p = lineEndOf(p); continue; }
+          p++;
+        }
+        return -1;
+      };
+
+      let ii = i, jj = j, changed = true;
+      while (changed) {
+        changed = false;
+        if (src[ii] === "(" || src[ii] === "[" || src[ii] === "{") {
+          const close = matchClosing(ii, jj);
+          if (close === jj) { ii++; jj--; changed = true; }
+        }
+        while (ii < jj && /\s/.test(src[ii])) ii++;
+        while (jj > ii && /\s/.test(src[jj - 1])) jj--;
+      }
+
+      // Must be one or more adjacent string literals, nothing else
+      let p = ii, sawString = false;
+      while (p < jj) {
+        while (p < jj && /\s/.test(src[p])) p++;
+        const s = tryScanString(p);
+        if (!s) { sawString = false; break; }
+        sawString = true;
+        p = s.end;
+        while (p < jj && /\s/.test(src[p])) p++;
+      }
+      if (!(sawString && p === jj)) { ctx.firstPending = false; return; }
+
+      // Docstring detected
+      const stmtIndent = src.substring(lineStartOf(a), ii).replace(/[^\t \f]/g, "");
+      if (sameLineSuite) {
+        const needPass = opt.insertPassForEmptyBlocks;
+        repls.push({ start: ii, end: jj, text: needPass ? "pass" : "" });
+        ctx.firstPending = false; return;
+      } else {
+        const needPass = opt.insertPassForEmptyBlocks && !hasContentInBlockAfterDocstring(jj, ctx.indent);
+        repls.push({ start: ii, end: jj, text: needPass ? stmtIndent + "pass" : "" });
+        ctx.firstPending = false; return;
+      }
+    }
+
+    const hasContentInBlockAfterDocstring = (pos: number, headerIndent: string): boolean => {
+      let i = pos;
+      while (i < n) {
+        const ls = lineStartOf(i);
+        let le = lineEndOf(ls);
+        const indent = (() => {
+          let k = ls, out = "";
+          while (k < le && (src[k] === " " || src[k] === "\t" || src[k] === "\f")) out += src[k++];
+          return out;
+        })();
+        // End of block?
+        if (!(indent.startsWith(headerIndent) && indent.length > headerIndent.length)) {
+          // Dedented to header or less → no more content in this block
+          return false;
+        }
+        // Skip blank lines and pure comment lines
+        let k = ls + indent.length;
+        while (k < le && /\s/.test(src[k])) k++;
+        if (k >= le) { i = le + 1; continue; }
+        if (src[k] === "#") { i = le + 1; continue; }
+        // Anything else counts as content (even another string)
+        return true;
+      }
+      return false;
+    }
+
+    // Walk file by physical lines; split into simple statements by ';' at depth 0
+    {
+      let i = 0;
+      while (i < n) {
+        const ls = lineStartOf(i);
+        let le = lineEndOf(ls);
+        const indent = (() => {
+          let k = ls, out = "";
+          while (k < le && (src[k] === " " || src[k] === "\t" || src[k] === "\f")) out += src[k++];
+          return out;
+        })();
+        // Dedent stack according to physical indent
+        while (stack.length > 1 && stack[stack.length - 1].indent.length > indent.length) stack.pop();
+
+        let j = ls + indent.length, depth = 0, stmtStart = j;
+        while (j <= le) {
+          if (j === le || (src[j] === ";" && depth === 0)) {
+            const stmtEnd = j;
+            if (stmtEnd > stmtStart) analyzeSimpleStatement(stmtStart, stmtEnd, stack[stack.length - 1]);
+            if (j === le) break;
+            j++; while (j < le && (src[j] === " " || src[j] === "\t")) j++;
+            stmtStart = j; continue;
+          }
+          const s = tryScanString(j);
+          if (s) {
+            // If the string literal spans beyond the current physical line,
+            // extend `le` so this whole logical statement is analyzed as one unit.
+            if (s.end > le) {
+              const pos = Math.min(n - 1, s.end - 1);
+              le = lineEndOf(pos);
+            }
+            j = s.end;
+            continue;
+          }
+          const c = src[j];
+          if (c === "(" || c === "[" || c === "{") { depth++; j++; continue; }
+          if (c === ")" || c === "]" || c === "}") { depth = Math.max(0, depth - 1); j++; continue; }
+          if (c === "#") { j = le; continue; }
+          j++;
+        }
+        i = le + 1;
+      }
+    }
+  }
+
+  // ---- apply replacements --------------------------------------------------
+  if (repls.length) {
+    repls.sort((a, b) => b.start - a.start);
+    let out = src;
+    for (const r of repls) out = out.slice(0, r.start) + (r.text ?? "") + out.slice(r.end);
+    if (!opt.preserveWhitespace) {
+      out = out
+        .split(/\r?\n/)
+        .map(l => l.replace(/[ \t\f]+$/g, ""))
+        .join(out.includes("\r\n") ? "\r\n" : "\n");
+    }
+    return out;
+  }
+  return src;
 }
+
 
 /**
  * After a docstring at `pos`, check for the next non-blank line:
