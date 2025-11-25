@@ -101,7 +101,7 @@ def _is_allowed(email: str | None) -> bool:
 # ────────────────────────────────────────────────────────────────────────────────
 # Request instrumentation
 # ────────────────────────────────────────────────────────────────────────────────
-PUBLIC_PATHS = {"/api/auth/start", "/api/auth/user"}
+PUBLIC_PATHS = {"/api/auth/start", "/api/auth/user", "/api/auth/refresh"}
 
 
 @app.before_request
@@ -457,6 +457,44 @@ def auth_start():
     url = f"{SUPABASE_URL}/auth/v1/authorize?provider=google&redirect_to={urllib.parse.quote(redirect_to, safe='')}"
     logger.info(f"Auth start redirect_to={redirect_to} rid={getattr(g,'_rid','-')}")
     return jsonify({"url": url})
+
+
+@app.route('/api/auth/refresh', methods=['POST'])
+def auth_refresh():
+    body = request.get_json(silent=True) or {}
+    refresh_token = body.get("refresh_token")
+    if not refresh_token:
+        return jsonify({"error": "Missing refresh_token"}), 400
+
+    try:
+        resp = requests.post(
+            f"{SUPABASE_URL}/auth/v1/token?grant_type=refresh_token",
+            headers={"apikey": SRK, "Content-Type": "application/json"},
+            json={"refresh_token": refresh_token},
+            timeout=15,
+        )
+    except Exception:
+        logger.exception("Failed to refresh token rid=%s", getattr(g, "_rid", "-"))
+        return jsonify({"error": "Failed to refresh token"}), 500
+
+    if resp.status_code != 200:
+        logger.warning(
+            "Supabase refresh failed status=%s rid=%s", resp.status_code, getattr(g, "_rid", "-")
+        )
+        return jsonify({"error": "Refresh rejected"}), 401
+
+    payload = resp.json() or {}
+    return (
+        jsonify(
+            {
+                "access_token": payload.get("access_token"),
+                "refresh_token": payload.get("refresh_token") or refresh_token,
+                "expires_in": payload.get("expires_in"),
+                "expires_at": payload.get("expires_at"),
+            }
+        ),
+        200,
+    )
 
 # ------------------------------------------------------------------------------
 # Dataset CRUD (protected)
@@ -831,17 +869,35 @@ def atomic_save(item_id):
             return jsonify({"error": "Missing 'data'"}), 400
 
         now = datetime.now().isoformat()
-          # Enforce: only compress the current head
-        try:
-            ds_res = supabase.table('dataset').select('currentVersionId').eq('id', item_id).single().execute()
-            ds = getattr(ds_res, "data", None) or {}
-            current_head = ds.get("currentVersionId")
-        except Exception:
-            current_head = None
 
-        if compress_into and compress_into != current_head:
-            # Treat as a new version instead of mutating history
-            compress_into = None
+        if compress_into:
+            # Only allow in-place mutation if the version is a leaf owned by the requester.
+            try:
+                vres = (
+                    supabase.table('task_versions')
+                    .select('id,author_id')
+                    .eq('id', compress_into)
+                    .eq('item_id', item_id)
+                    .single()
+                    .execute()
+                )
+                vrow = getattr(vres, 'data', None) or {}
+                if vrow.get('author_id') != uid:
+                    compress_into = None
+                else:
+                    child_res = (
+                        supabase.table('task_versions')
+                        .select('id')
+                        .eq('parent_id', compress_into)
+                        .eq('item_id', item_id)
+                        .limit(1)
+                        .execute()
+                    )
+                    if getattr(child_res, 'data', []) :
+                        compress_into = None
+            except Exception:
+                compress_into = None
+
         if compress_into:
             # Update existing version in place
             patch = {"data": snapshot}
